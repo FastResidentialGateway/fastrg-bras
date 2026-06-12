@@ -5,6 +5,7 @@ SRCS := src/main.c \
         src/pppoe.c \
         src/ppp.c \
         src/nat.c \
+        src/arp.c \
         src/datapath.c
 
 OBJS := $(SRCS:.c=.o)

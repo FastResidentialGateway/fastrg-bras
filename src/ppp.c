@@ -47,6 +47,7 @@ begin_ppp_frame(struct rte_mbuf **out_mbuf,
 {
     uint16_t total =
         sizeof(struct rte_ether_hdr) +
+        (sess->tx_vlan ? sizeof(struct rte_vlan_hdr) : 0) +
         sizeof(struct pppoe_hdr) +
         sizeof(struct ppp_hdr) +
         payload_room;
@@ -60,8 +61,14 @@ begin_ppp_frame(struct rte_mbuf **out_mbuf,
     struct rte_ether_hdr *eth = (struct rte_ether_hdr *)p;
     rte_ether_addr_copy(&sess->client_mac, &eth->dst_addr);
     rte_ether_addr_copy(&g_bras.wan_mac,   &eth->src_addr);
-    eth->ether_type = htons(ETH_P_PPPoE_SESS);
+    eth->ether_type = htons(sess->tx_vlan ? ETH_P_8021Q : ETH_P_PPPoE_SESS);
     p += sizeof(*eth);
+    if (sess->tx_vlan) {
+        struct rte_vlan_hdr *vh = (struct rte_vlan_hdr *)p;
+        vh->vlan_tci = htons(sess->vlan_tci);
+        vh->eth_proto = htons(ETH_P_PPPoE_SESS);
+        p += sizeof(*vh);
+    }
 
     /* PPPoE */
     struct pppoe_hdr *ph = (struct pppoe_hdr *)p;
@@ -90,14 +97,20 @@ finish_and_send(struct rte_mbuf *m)
 /* ── LCP ──────────────────────────────────────────────────────────────── */
 
 /*
- * lcp_send_conf_req — server initiates LCP: MRU=1492, auth=CHAP, magic.
+ * lcp_send_conf_req — server initiates LCP: MRU=1488, auth=PAP or CHAP, magic.
+ * Reads sess->auth_method (defaults to PAP on first call).
+ * CHAP auth option is 5 bytes (type+len+proto+algo); PAP is 4 bytes.
  */
 void
 lcp_send_conf_req(struct bras_session *sess)
 {
-    /* Options: MRU(4 bytes) + Auth(5 bytes) + Magic(6 bytes) = 15 bytes */
-    uint16_t opts_len = 15;
-    uint16_t payload_len = sizeof(struct lcp_hdr) + opts_len;
+    if (sess->auth_method == AUTH_NONE)
+        sess->auth_method = AUTH_PAP;
+
+    /* CHAP option carries an extra algorithm byte (0x05 = MD5) */
+    uint16_t auth_opt_len = (sess->auth_method == AUTH_CHAP) ? 5 : 4;
+    uint16_t opts_len     = 4 + auth_opt_len + 6; /* MRU + Auth + Magic */
+    uint16_t payload_len  = sizeof(struct lcp_hdr) + opts_len;
 
     struct rte_mbuf *m;
     uint8_t *p = begin_ppp_frame(&m, sess, PPP_LCP, payload_len);
@@ -109,18 +122,23 @@ lcp_send_conf_req(struct bras_session *sess)
     lcp->length     = htons(sizeof(struct lcp_hdr) + opts_len);
     uint8_t *opt = p + sizeof(struct lcp_hdr);
 
-    /* MRU = 1492 */
-    opt[0] = LCP_OPT_MRU;  opt[1] = 4;
-    uint16_t mru = htons(1492);
+    /* MRU = 1488 for VLAN + PPPoE overhead */
+    opt[0] = LCP_OPT_MRU; opt[1] = 4;
+    uint16_t mru = htons(1488);
     memcpy(&opt[2], &mru, 2);
     opt += 4;
 
-    /* Auth = CHAP MD5: type=0xC2, alg=0x05 */
-    opt[0] = LCP_OPT_AUTH; opt[1] = 5;
-    uint16_t chap_proto = htons(PPP_CHAP);
-    memcpy(&opt[2], &chap_proto, 2);
-    opt[4] = 0x05;  /* MD5 */
-    opt += 5;
+    /* Auth option */
+    opt[0] = LCP_OPT_AUTH; opt[1] = auth_opt_len;
+    if (sess->auth_method == AUTH_CHAP) {
+        uint16_t proto = htons(PPP_CHAP);
+        memcpy(&opt[2], &proto, 2);
+        opt[4] = 0x05; /* MD5 */
+    } else {
+        uint16_t proto = htons(PPP_PAP);
+        memcpy(&opt[2], &proto, 2);
+    }
+    opt += auth_opt_len;
 
     /* Magic number */
     sess->magic_number = (uint32_t)rte_rand();
@@ -130,7 +148,9 @@ lcp_send_conf_req(struct bras_session *sess)
 
     sess->state = SESS_LCP_REQ_SENT;
     finish_and_send(m);
-    RTE_LOG(DEBUG, PPP, "[%u] LCP CONF_REQ sent\n", sess->session_id);
+    RTE_LOG(DEBUG, PPP, "[%u] LCP CONF_REQ sent (auth=%s)\n",
+            sess->session_id,
+            sess->auth_method == AUTH_CHAP ? "CHAP" : "PAP");
 }
 
 /*
@@ -251,10 +271,16 @@ chap_send_result(struct bras_session *sess, int success)
 void
 ipcp_send_conf_req(struct bras_session *sess)
 {
-    /* Offer our PPP endpoint IP */
-    sess->server_ip = session_alloc_ip(sess->session_id);
-    /* Client will be .session_id+1 in the pool */
-    sess->client_ip = sess->server_ip + 1;
+    /* Our PPP endpoint is fixed; client gets one IP from the linear pool */
+    sess->server_ip = g_bras.ppp_local_ip;
+    if (sess->client_ip == 0)
+        sess->client_ip = session_alloc_ip(sess->session_id);
+    if (sess->client_ip == 0) {
+        RTE_LOG(ERR, PPP, "[%u] IP pool exhausted — terminating session\n",
+                sess->session_id);
+        pppoe_send_padt(sess);
+        return;
+    }
 
     uint16_t opts_len    = 6;   /* type(1)+len(1)+ip(4) */
     uint16_t payload_len = sizeof(struct lcp_hdr) + opts_len;
@@ -325,11 +351,12 @@ ppp_handle_ctrl(struct rte_mbuf *mbuf, uint16_t session_id)
     sess->last_activity = rte_rdtsc();
 
     uint8_t *base = rte_pktmbuf_mtod(mbuf, uint8_t *);
-    size_t off = sizeof(struct rte_ether_hdr) +
-                 sizeof(struct pppoe_hdr) +
-                 sizeof(struct ppp_hdr);
+    uint16_t l2_len, vlan_tci;
+    bras_frame_ethertype(base, &l2_len, &vlan_tci);
+    (void)vlan_tci;
+    size_t off = l2_len + sizeof(struct pppoe_hdr) + sizeof(struct ppp_hdr);
     struct ppp_hdr *pph = (struct ppp_hdr *)
-        (base + sizeof(struct rte_ether_hdr) + sizeof(struct pppoe_hdr));
+        (base + l2_len + sizeof(struct pppoe_hdr));
     uint16_t proto = ntohs(pph->protocol);
 
     struct lcp_hdr *lcp = (struct lcp_hdr *)(base + off);
@@ -343,24 +370,42 @@ ppp_handle_ctrl(struct rte_mbuf *mbuf, uint16_t session_id)
             RTE_LOG(DEBUG, PPP, "[%u] LCP CONF_REQ from client\n", session_id);
             /* ACK client's options (simplified — accept everything) */
             lcp_send_conf_ack(sess, lcp, lcp_len);
-            /* If we also got ACK for our own CONF_REQ, move to LCP_UP */
-            if (sess->state == SESS_LCP_REQ_SENT)
-                ; /* wait for our ACK first */
             break;
 
         case LCP_CONF_ACK:
             RTE_LOG(DEBUG, PPP, "[%u] LCP CONF_ACK from client\n", session_id);
             sess->state = SESS_LCP_UP;
-            /* Start auth */
-            chap_send_challenge(sess);
+            if (sess->auth_method == AUTH_CHAP) {
+                chap_send_challenge(sess);
+            } else {
+                sess->state = SESS_AUTH_PENDING;
+                RTE_LOG(DEBUG, PPP, "[%u] waiting for PAP AUTH_REQ\n",
+                        session_id);
+            }
             break;
 
-        case LCP_CONF_NAK:
-            /* Re-send with adjusted options (simplified: resend same) */
-            RTE_LOG(DEBUG, PPP, "[%u] LCP CONF_NAK — resending CONF_REQ\n",
-                    session_id);
+        case LCP_CONF_NAK: {
+            /* Parse NAK options: if client proposes a different auth, adopt it */
+            uint8_t *opt = (uint8_t *)lcp + sizeof(struct lcp_hdr);
+            uint8_t *end = (uint8_t *)lcp + lcp_len;
+            while (opt + 2 <= end && opt[1] >= 2 && opt + opt[1] <= end) {
+                if (opt[0] == LCP_OPT_AUTH && opt[1] >= 4) {
+                    uint16_t proto;
+                    memcpy(&proto, &opt[2], 2);
+                    proto = ntohs(proto);
+                    if (proto == PPP_CHAP)
+                        sess->auth_method = AUTH_CHAP;
+                    else if (proto == PPP_PAP)
+                        sess->auth_method = AUTH_PAP;
+                }
+                opt += opt[1];
+            }
+            RTE_LOG(DEBUG, PPP, "[%u] LCP CONF_NAK — resending CONF_REQ (auth=%s)\n",
+                    session_id,
+                    sess->auth_method == AUTH_CHAP ? "CHAP" : "PAP");
             lcp_send_conf_req(sess);
             break;
+        }
 
         case LCP_TERM_REQ:
             RTE_LOG(INFO, PPP, "[%u] LCP TERM_REQ from client\n", session_id);
@@ -415,6 +460,7 @@ ppp_handle_ctrl(struct rte_mbuf *mbuf, uint16_t session_id)
                 p[4] = strlen(msg); memcpy(&p[5],msg,strlen(msg));
                 finish_and_send(m);
             }
+            sess->state = SESS_AUTH_PENDING;
             ipcp_send_conf_req(sess);
         }
         break;
@@ -471,7 +517,7 @@ ppp_handle_ctrl(struct rte_mbuf *mbuf, uint16_t session_id)
                     all_ok = 0;
                 } else if (oval != want) {
                     /* NAK: insert our value */
-                    if (nak_len + 6 <= sizeof(nak_buf)) {
+                    if ((size_t)nak_len + 6 <= sizeof(nak_buf)) {
                         nak_buf[nak_len + 0] = otype;
                         nak_buf[nak_len + 1] = 6;
                         uint32_t be = htonl(want);

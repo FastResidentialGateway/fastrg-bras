@@ -13,6 +13,7 @@
 #include <string.h>
 #include <arpa/inet.h>
 #include <rte_ether.h>
+#include <rte_ethdev.h>
 #include <rte_mbuf.h>
 #include <rte_log.h>
 #include <rte_cycles.h>
@@ -23,17 +24,26 @@
 
 /* ── internal helpers ─────────────────────────────────────────────────── */
 
-/* Find a session by client MAC (for matching PADR to existing PADI record) */
+/* Find the most-recent session from this MAC/VLAN in the given state.
+ * All fastrg users share the NIC port MAC, so a stale session in another
+ * state (e.g. SESS_UP left over from an ungraceful client restart) must
+ * not shadow the fresh PADO_SENT entry created by the latest PADI. */
 static struct bras_session *
-find_sess_by_mac(const struct rte_ether_addr *mac)
+find_sess_by_mac_vlan(const struct rte_ether_addr *mac,
+                      uint8_t has_vlan, uint16_t vlan_tci,
+                      sess_state_t state)
 {
+    struct bras_session *best = NULL;
     for (int i = 1; i <= MAX_SESSIONS; i++) {
         struct bras_session *s = &g_bras.sessions[i];
-        if (s->state != SESS_FREE &&
-            rte_is_same_ether_addr(&s->client_mac, mac))
-            return s;
+        if (s->state == state &&
+            rte_is_same_ether_addr(&s->client_mac, mac) &&
+            s->has_vlan == has_vlan &&
+            (!has_vlan || s->vlan_tci == vlan_tci) &&
+            (!best || s->last_activity > best->last_activity))
+            best = s;
     }
-    return NULL;
+    return best;
 }
 
 /* Append a PPPoE tag to a buffer; returns new write pointer */
@@ -50,11 +60,14 @@ append_tag(uint8_t *p, uint16_t type, const void *val, uint16_t vlen)
 
 /* Build a complete Ethernet + PPPoE discovery frame into a fresh mbuf */
 static struct rte_mbuf *
-build_disc_frame(const struct rte_ether_addr *dst,
+build_disc_frame(struct bras_session *sess,
+                 const struct rte_ether_addr *dst,
                  uint8_t code, uint16_t session_id,
                  const uint8_t *payload, uint16_t payload_len)
 {
-    struct rte_mbuf *m = alloc_pkt(sizeof(struct rte_ether_hdr) +
+    uint16_t l2_len = sizeof(struct rte_ether_hdr) +
+                      (sess->tx_vlan ? sizeof(struct rte_vlan_hdr) : 0);
+    struct rte_mbuf *m = alloc_pkt(l2_len +
                                    sizeof(struct pppoe_hdr) + payload_len);
     if (!m) return NULL;
 
@@ -64,8 +77,14 @@ build_disc_frame(const struct rte_ether_addr *dst,
     struct rte_ether_hdr *eth = (struct rte_ether_hdr *)p;
     rte_ether_addr_copy(dst, &eth->dst_addr);
     rte_ether_addr_copy(&g_bras.wan_mac, &eth->src_addr);
-    eth->ether_type = htons(ETH_P_PPPoE_DISC);
+    eth->ether_type = htons(sess->tx_vlan ? ETH_P_8021Q : ETH_P_PPPoE_DISC);
     p += sizeof(struct rte_ether_hdr);
+    if (sess->tx_vlan) {
+        struct rte_vlan_hdr *vh = (struct rte_vlan_hdr *)p;
+        vh->vlan_tci = htons(sess->vlan_tci);
+        vh->eth_proto = htons(ETH_P_PPPoE_DISC);
+        p += sizeof(*vh);
+    }
 
     /* PPPoE header */
     struct pppoe_hdr *ph = (struct pppoe_hdr *)p;
@@ -79,7 +98,7 @@ build_disc_frame(const struct rte_ether_addr *dst,
         memcpy(p, payload, payload_len);
 
     m->data_len = m->pkt_len =
-        sizeof(struct rte_ether_hdr) + sizeof(struct pppoe_hdr) + payload_len;
+        l2_len + sizeof(struct pppoe_hdr) + payload_len;
 
     return m;
 }
@@ -96,14 +115,17 @@ pppoe_handle_discovery(struct rte_mbuf *mbuf)
     uint8_t *p = rte_pktmbuf_mtod(mbuf, uint8_t *);
 
     struct rte_ether_hdr *eth = (struct rte_ether_hdr *)p;
-    struct pppoe_hdr *ph = (struct pppoe_hdr *)(p + sizeof(struct rte_ether_hdr));
+    uint16_t l2_len, vlan_tci;
+    bras_frame_ethertype(p, &l2_len, &vlan_tci);
+    struct pppoe_hdr *ph = (struct pppoe_hdr *)(p + l2_len);
     uint16_t sess_id = ntohs(ph->session_id);
 
     switch (ph->code) {
     /* ── PADI  ──────────────────────────────────────────────────────── */
     case PPPOE_CODE_PADI: {
-        RTE_LOG(DEBUG, PPPOE, "PADI from "RTE_ETHER_ADDR_PRT_FMT"\n",
-                RTE_ETHER_ADDR_BYTES(&eth->src_addr));
+        RTE_LOG(DEBUG, PPPOE,
+                "PADI from "RTE_ETHER_ADDR_PRT_FMT" (l2_len=%u vlan_tci=0x%x)\n",
+                RTE_ETHER_ADDR_BYTES(&eth->src_addr), l2_len, vlan_tci);
 
         /* Allocate a fresh session slot */
         uint16_t sid = alloc_session_id();
@@ -117,7 +139,33 @@ pppoe_handle_discovery(struct rte_mbuf *mbuf)
         s->session_id = sid;
         rte_ether_addr_copy(&eth->src_addr, &s->client_mac);
         rte_ether_addr_copy(&g_bras.wan_mac, &s->server_mac);
+        s->has_vlan = (l2_len > sizeof(struct rte_ether_hdr));
+        s->tx_vlan  = s->has_vlan;
+        s->vlan_tci = vlan_tci;
         s->last_activity = rte_rdtsc();
+
+        /* 82599 VF: software-tagged TX is silently dropped by the PF's TX
+         * switch unless the VLAN is registered in the VLVF.  Try to register
+         * it via the PF mailbox.  If the PF NACKs, it has administratively
+         * assigned a port VLAN (VMVIR) to this VF: RX still shows the tag
+         * (no strip in our VF), but TX must go out untagged — the PF inserts
+         * the tag in hardware. */
+        if (s->has_vlan) {
+            uint16_t vid = s->vlan_tci & 0x0FFF;
+            if (!g_bras.vlan_registered[vid]) {
+                int vret = rte_eth_dev_vlan_filter(WAN_PORT, vid, 1);
+                g_bras.vlan_registered[vid] = (vret == 0) ? 1 : 2;
+                if (vret == 0)
+                    RTE_LOG(INFO, PPPOE, "registered VLAN %u on WAN port\n",
+                            vid);
+                else
+                    RTE_LOG(INFO, PPPOE,
+                            "PF refused VLAN %u filter (%d) — assuming port "
+                            "VLAN, sending untagged TX\n", vid, vret);
+            }
+            if (g_bras.vlan_registered[vid] == 2)
+                s->tx_vlan = 0;
+        }
 
         /* Extract Host-Uniq tag if present */
         uint8_t *tp = (uint8_t *)(ph + 1);
@@ -144,8 +192,12 @@ pppoe_handle_discovery(struct rte_mbuf *mbuf)
         RTE_LOG(DEBUG, PPPOE, "PADR from "RTE_ETHER_ADDR_PRT_FMT"\n",
                 RTE_ETHER_ADDR_BYTES(&eth->src_addr));
 
-        struct bras_session *s = find_sess_by_mac(&eth->src_addr);
-        if (!s || s->state != SESS_PADO_SENT) {
+        struct bras_session *s = find_sess_by_mac_vlan(
+            &eth->src_addr,
+            l2_len > sizeof(struct rte_ether_hdr),
+            vlan_tci,
+            SESS_PADO_SENT);
+        if (!s) {
             RTE_LOG(WARNING, PPPOE, "PADR: no matching session in PADO_SENT\n");
             rte_pktmbuf_free(mbuf);
             return;
@@ -181,27 +233,29 @@ pppoe_handle_discovery(struct rte_mbuf *mbuf)
 void
 pppoe_send_pado(struct bras_session *sess, struct rte_mbuf *padi_mbuf)
 {
-    static const char ac_name[] = "dpdk-bras";
+    (void)padi_mbuf;
     uint8_t tags[128];
     uint8_t *tp = tags;
 
-    /* AC-Name tag */
-    tp = append_tag(tp, PPPOE_TAG_AC_NAME,
-                    ac_name, (uint16_t)strlen(ac_name));
-
-    /* Echo back Host-Uniq if present */
-    if (sess->host_uniq_len)
-        tp = append_tag(tp, PPPOE_TAG_HOST_UNIQ,
-                        sess->host_uniq, sess->host_uniq_len);
-
-    /* AC-Cookie: use session_id as a trivial cookie (expand for security) */
-    uint16_t cookie = htons(sess->session_id);
-    tp = append_tag(tp, PPPOE_TAG_AC_COOKIE, &cookie, sizeof(cookie));
-
-    tp = append_tag(tp, PPPOE_TAG_EOL, NULL, 0);
+    if (sess->has_vlan) {
+        /* fastrg-node stores only the first tag's length bytes from PADO.
+         * A minimal EOL tag keeps its PADR builder deterministic. */
+        uint32_t zero = 0;
+        tp = append_tag(tp, PPPOE_TAG_EOL, &zero, sizeof(zero));
+    } else {
+        static const char ac_name[] = "dpdk-bras";
+        tp = append_tag(tp, PPPOE_TAG_AC_NAME,
+                        ac_name, (uint16_t)strlen(ac_name));
+        if (sess->host_uniq_len)
+            tp = append_tag(tp, PPPOE_TAG_HOST_UNIQ,
+                            sess->host_uniq, sess->host_uniq_len);
+        uint16_t cookie = htons(sess->session_id);
+        tp = append_tag(tp, PPPOE_TAG_AC_COOKIE, &cookie, sizeof(cookie));
+        tp = append_tag(tp, PPPOE_TAG_EOL, NULL, 0);
+    }
 
     uint16_t payload_len = (uint16_t)(tp - tags);
-    struct rte_mbuf *m = build_disc_frame(&sess->client_mac,
+    struct rte_mbuf *m = build_disc_frame(sess, &sess->client_mac,
                                           PPPOE_CODE_PADO,
                                           0,            /* session_id=0 for PADO */
                                           tags, payload_len);
@@ -229,7 +283,7 @@ pppoe_send_pads(struct bras_session *sess, struct rte_mbuf *padr_mbuf __rte_unus
     tp = append_tag(tp, PPPOE_TAG_EOL, NULL, 0);
 
     uint16_t payload_len = (uint16_t)(tp - tags);
-    struct rte_mbuf *m = build_disc_frame(&sess->client_mac,
+    struct rte_mbuf *m = build_disc_frame(sess, &sess->client_mac,
                                           PPPOE_CODE_PADS,
                                           sess->session_id,
                                           tags, payload_len);
@@ -257,7 +311,7 @@ pppoe_send_padt(struct bras_session *sess)
     uint8_t *tp = tags;
     tp = append_tag(tp, PPPOE_TAG_EOL, NULL, 0);
 
-    struct rte_mbuf *m = build_disc_frame(&sess->client_mac,
+    struct rte_mbuf *m = build_disc_frame(sess, &sess->client_mac,
                                           PPPOE_CODE_PADT,
                                           sess->session_id,
                                           tags, (uint16_t)(tp - tags));

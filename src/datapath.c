@@ -1,24 +1,48 @@
 /* datapath.c — fast-path RX/TX worker and control-plane lcore
  *
- *  LCORE_RX_TX:   poll WAN+LAN, classify packets, handle data-path inline,
- *                 enqueue control frames to ctrl_ring.
+ * Two datapath modes, selected at startup in main():
+ *
+ *  distributor (default on real NICs):
+ *      rx_dist_lcore     poll WAN+LAN queue 0, classify, tag data packets
+ *                        by flow 5-tuple, fan out via rte_distributor.
+ *      dist_worker_lcore N workers: NAT + forward, each with own TX queue.
+ *      The X520/82599 VF cannot RSS PPPoE frames (the inner IP hides behind
+ *      the PPPoE header), so the fan-out must happen in software.  The
+ *      distributor keeps every flow on one worker and in order.
+ *
+ *  legacy (single-queue vdevs, e.g. af_packet on veth):
+ *      datapath_lcore    poll WAN+LAN, classify + NAT + forward inline.
  *
  *  LCORE_CTRL:    drain ctrl_ring, run PPPoE discovery + PPP state machines.
  */
 
 #include <string.h>
+#include <netinet/in.h>
 #include <rte_mbuf.h>
 #include <rte_ethdev.h>
 #include <rte_ether.h>
+#include <rte_ip.h>
 #include <rte_log.h>
 #include <rte_ring.h>
 #include <rte_cycles.h>
+#include <rte_distributor.h>
+#include <rte_hash_crc.h>
 
 #include "bras.h"
 
 #define RTE_LOGTYPE_DP   RTE_LOGTYPE_USER4
 
 /* ── fast-path helpers ────────────────────────────────────────────────── */
+
+/* Count + (optionally) capture + free a dropped data packet.  RX-side
+ * drops are recorded as ingress on the packet's origin port. */
+static inline void
+drop_pkt(struct rte_mbuf *m, const char *reason)
+{
+    g_bras.stat_pkts_dropped++;
+    drop_capture(m, m->port, RTE_PCAPNG_DIRECTION_IN, reason);
+    rte_pktmbuf_free(m);
+}
 
 /*
  * Decide if a PPPoE session frame contains PPP control traffic
@@ -28,8 +52,11 @@ static inline int
 is_ppp_ctrl(struct rte_mbuf *mbuf)
 {
     uint8_t *p = rte_pktmbuf_mtod(mbuf, uint8_t *);
+    uint16_t l2_len, vlan_tci;
+    bras_frame_ethertype(p, &l2_len, &vlan_tci);
+    (void)vlan_tci;
     struct ppp_hdr *pph = (struct ppp_hdr *)
-        (p + sizeof(struct rte_ether_hdr) + sizeof(struct pppoe_hdr));
+        (p + l2_len + sizeof(struct pppoe_hdr));
     uint16_t proto = ntohs(pph->protocol);
     return (proto != PPP_IP);
 }
@@ -64,8 +91,16 @@ process_wan_burst(struct rte_mbuf **pkts, uint16_t nb)
         g_bras.stat_pkts_rx++;
 
         uint8_t *p = rte_pktmbuf_mtod(m, uint8_t *);
-        struct rte_ether_hdr *eth = (struct rte_ether_hdr *)p;
-        uint16_t etype = ntohs(eth->ether_type);
+        uint16_t l2_len, vlan_tci;
+        uint16_t etype = bras_frame_ethertype(p, &l2_len, &vlan_tci);
+
+        /* --vlans filter: reject PPPoE outside the allowed VLAN set */
+        if ((etype == ETH_P_PPPoE_DISC || etype == ETH_P_PPPoE_SESS) &&
+            !bras_vlan_accepted(l2_len, vlan_tci)) {
+            g_bras.stat_drop_vlan++;
+            drop_pkt(m, "drop:vlan");
+            continue;
+        }
 
         if (etype == ETH_P_PPPoE_DISC) {
             /* Discovery frames → control plane */
@@ -75,7 +110,7 @@ process_wan_burst(struct rte_mbuf **pkts, uint16_t nb)
 
         if (etype == ETH_P_PPPoE_SESS) {
             struct pppoe_hdr *ph =
-                (struct pppoe_hdr *)(p + sizeof(struct rte_ether_hdr));
+                (struct pppoe_hdr *)(p + l2_len);
             uint16_t sid = ntohs(ph->session_id);
 
             if (sid == 0 || sid > MAX_SESSIONS ||
@@ -93,19 +128,19 @@ process_wan_burst(struct rte_mbuf **pkts, uint16_t nb)
 
             /* ── Data packet on established session ── */
             struct bras_session *sess = &g_bras.sessions[sid];
-            if (nat_translate_outbound(m, sess) == 0) {
+            if (route_outbound(m, sess) == 0) {
                 send_pkt(LAN_PORT, m);
                 g_bras.stat_pkts_tx++;
             } else {
-                g_bras.stat_pkts_dropped++;
-                rte_pktmbuf_free(m);
+                g_bras.stat_drop_route++;
+                drop_pkt(m, "drop:route");
             }
             continue;
         }
 
         /* Unknown ethertype — drop */
-        g_bras.stat_pkts_dropped++;
-        rte_pktmbuf_free(m);
+        g_bras.stat_drop_other++;
+        drop_pkt(m, "drop:other");
     }
 }
 
@@ -118,14 +153,260 @@ process_lan_burst(struct rte_mbuf **pkts, uint16_t nb)
         struct rte_mbuf *m = pkts[i];
         g_bras.stat_pkts_rx++;
 
-        if (nat_translate_inbound(m) == 0) {
+        struct rte_ether_hdr *eth =
+            rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
+
+        /* ARP: answer requests for our SNAT IP / learn next-hop MAC */
+        if (eth->ether_type == htons(RTE_ETHER_TYPE_ARP)) {
+            arp_input(m);
+            continue;
+        }
+
+        /* Pings to our SNAT IP are answered locally */
+        if (lan_icmp_echo_input(m) == 0) {
+            g_bras.stat_pkts_tx++;
+            continue;
+        }
+
+        if (route_inbound(m) == 0) {
             send_pkt(WAN_PORT, m);
             g_bras.stat_pkts_tx++;
         } else {
-            g_bras.stat_pkts_dropped++;
-            rte_pktmbuf_free(m);
+            g_bras.stat_drop_route++;
+            drop_pkt(m, "drop:route");
         }
     }
+}
+
+/* ── distributor datapath ─────────────────────────────────────────────── */
+
+/*
+ * flow_tag — per-direction 5-tuple hash used as the distributor tag.
+ * The distributor keeps every packet sharing a tag on a single worker and
+ * in order, so same-flow packets never race while distinct flows (even
+ * within one PPPoE session) spread across workers.  Fragments fall back to
+ * the IP pair so all pieces of a datagram share a tag.
+ */
+static inline uint32_t
+flow_tag(const uint8_t *ip_start)
+{
+    const struct rte_ipv4_hdr *ip = (const struct rte_ipv4_hdr *)ip_start;
+    uint32_t tag = rte_hash_crc_4byte(ip->src_addr, 0);
+    tag = rte_hash_crc_4byte(ip->dst_addr, tag);
+
+    uint32_t l4_ports = 0;
+    uint8_t  proto    = ip->next_proto_id;
+    uint16_t frag     = rte_be_to_cpu_16(ip->fragment_offset);
+    if ((proto == IPPROTO_TCP || proto == IPPROTO_UDP) &&
+        (frag & (RTE_IPV4_HDR_OFFSET_MASK | RTE_IPV4_HDR_MF_FLAG)) == 0)
+        memcpy(&l4_ports,
+               ip_start + ((ip->version_ihl & 0xF) << 2), sizeof(l4_ports));
+
+    tag = rte_hash_crc_4byte(l4_ports, tag);
+    return rte_hash_crc_4byte(proto, tag);
+}
+
+/*
+ * Classify one WAN burst: control traffic to the ctrl ring (as in legacy
+ * mode), session data tagged and appended to the distributor batch.
+ * Returns the new batch length.
+ */
+static uint16_t
+classify_wan_dist(struct rte_mbuf **pkts, uint16_t nb,
+                  struct rte_mbuf **batch, uint16_t n_batch)
+{
+    for (uint16_t i = 0; i < nb; i++) {
+        struct rte_mbuf *m = pkts[i];
+        g_bras.stat_pkts_rx++;
+
+        uint8_t *p = rte_pktmbuf_mtod(m, uint8_t *);
+        uint16_t l2_len, vlan_tci;
+        uint16_t etype = bras_frame_ethertype(p, &l2_len, &vlan_tci);
+
+        /* --vlans filter: reject PPPoE outside the allowed VLAN set */
+        if ((etype == ETH_P_PPPoE_DISC || etype == ETH_P_PPPoE_SESS) &&
+            !bras_vlan_accepted(l2_len, vlan_tci)) {
+            g_bras.stat_drop_vlan++;
+            drop_pkt(m, "drop:vlan");
+            continue;
+        }
+
+        if (etype == ETH_P_PPPoE_DISC) {
+            enqueue_ctrl(m, CTRL_MSG_PPPOE_DISC, 0);
+            continue;
+        }
+
+        if (etype == ETH_P_PPPoE_SESS) {
+            struct pppoe_hdr *ph = (struct pppoe_hdr *)(p + l2_len);
+            uint16_t sid = ntohs(ph->session_id);
+
+            if (sid == 0 || sid > MAX_SESSIONS ||
+                g_bras.sessions[sid].state != SESS_UP ||
+                is_ppp_ctrl(m)) {
+                enqueue_ctrl(m, CTRL_MSG_PPP_CTRL, sid);
+                continue;
+            }
+
+            /* Data on an UP session → tag by the inner 5-tuple */
+            m->hash.usr = flow_tag(p + l2_len +
+                                   sizeof(struct pppoe_hdr) +
+                                   sizeof(struct ppp_hdr));
+            batch[n_batch++] = m;
+            continue;
+        }
+
+        g_bras.stat_drop_other++;
+        drop_pkt(m, "drop:other");
+    }
+    return n_batch;
+}
+
+/*
+ * Classify one LAN burst: ARP and pings to our SNAT IP handled inline
+ * (low volume), IPv4 data tagged by its outer 5-tuple for the workers.
+ * Returns the new batch length.
+ */
+static uint16_t
+classify_lan_dist(struct rte_mbuf **pkts, uint16_t nb,
+                  struct rte_mbuf **batch, uint16_t n_batch)
+{
+    for (uint16_t i = 0; i < nb; i++) {
+        struct rte_mbuf *m = pkts[i];
+        g_bras.stat_pkts_rx++;
+
+        struct rte_ether_hdr *eth =
+            rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
+
+        if (eth->ether_type == htons(RTE_ETHER_TYPE_ARP)) {
+            arp_input(m);
+            continue;
+        }
+
+        if (lan_icmp_echo_input(m) == 0) {
+            g_bras.stat_pkts_tx++;
+            continue;
+        }
+
+        if (eth->ether_type == htons(RTE_ETHER_TYPE_IPV4)) {
+            m->hash.usr =
+                flow_tag((uint8_t *)eth + sizeof(struct rte_ether_hdr));
+            batch[n_batch++] = m;
+            continue;
+        }
+
+        g_bras.stat_drop_other++;
+        drop_pkt(m, "drop:other");
+    }
+    return n_batch;
+}
+
+/*
+ * rx_dist_lcore — distributor-mode RX/classify lcore.
+ * Polls both ports' queue 0 and fans data packets out to the workers.
+ */
+int
+rx_dist_lcore(void *arg __rte_unused)
+{
+    struct rte_distributor *dist = g_bras.dist;
+    struct rte_mbuf *pkts[BURST_SIZE];
+    struct rte_mbuf *batch[2 * BURST_SIZE];
+    struct rte_mbuf *ret[2 * BURST_SIZE];
+    uint16_t nb, n_batch;
+
+    RTE_LOG(INFO, DP, "RX/classify lcore %u started (distributor, %u workers)\n",
+            rte_lcore_id(), g_bras.n_workers);
+
+    while (g_running) {
+        n_batch = 0;
+        nb = rte_eth_rx_burst(WAN_PORT, 0, pkts, BURST_SIZE);
+        if (nb > 0)
+            n_batch = classify_wan_dist(pkts, nb, batch, n_batch);
+
+        nb = rte_eth_rx_burst(LAN_PORT, 0, pkts, BURST_SIZE);
+        if (nb > 0)
+            n_batch = classify_lan_dist(pkts, nb, batch, n_batch);
+
+        /* An empty call still flushes the internal backlog toward
+         * idle workers, so call unconditionally. */
+        int nd = rte_distributor_process(dist, n_batch ? batch : NULL,
+                                         n_batch);
+        for (int k = nd < 0 ? 0 : nd; k < n_batch; k++) {
+            g_bras.stat_drop_dist++;
+            drop_pkt(batch[k], "drop:dist");
+        }
+
+        /* Workers hand each batch back after TX purely for the
+         * distributor's in-flight bookkeeping — drain and ignore. */
+        rte_distributor_returned_pkts(dist, ret, RTE_DIM(ret));
+    }
+
+    rte_distributor_flush(dist);
+    rte_distributor_clear_returns(dist);
+    RTE_LOG(INFO, DP, "RX/classify lcore %u stopping\n", rte_lcore_id());
+    return 0;
+}
+
+/*
+ * dist_worker_lcore — NAT + forwarding worker (arg = worker id).
+ * Uses the non-blocking request/poll API so g_running stays honoured even
+ * when no traffic is in flight.
+ */
+int
+dist_worker_lcore(void *arg)
+{
+    unsigned int wid = (unsigned int)(uintptr_t)arg;
+    struct rte_distributor *dist = g_bras.dist;
+    struct rte_mbuf *bufs[BURST_SIZE];
+    int n;
+
+    RTE_LOG(INFO, DP, "distributor worker %u started (lcore %u, TX queue %u)\n",
+            wid, rte_lcore_id(), g_bras.lcore_queue[rte_lcore_id()]);
+
+    rte_distributor_request_pkt(dist, wid, NULL, 0);
+    while (g_running) {
+        n = rte_distributor_poll_pkt(dist, wid, bufs);
+        if (n < 0) {
+            rte_pause();
+            continue;
+        }
+
+        g_bras.stat_worker_pkts[wid] += n;
+        for (int i = 0; i < n; i++) {
+            struct rte_mbuf *m = bufs[i];
+
+            if (m->port == WAN_PORT) {
+                uint8_t *p = rte_pktmbuf_mtod(m, uint8_t *);
+                uint16_t l2_len, vlan_tci;
+                bras_frame_ethertype(p, &l2_len, &vlan_tci);
+                struct pppoe_hdr *ph = (struct pppoe_hdr *)(p + l2_len);
+                uint16_t sid = ntohs(ph->session_id);
+                struct bras_session *sess = &g_bras.sessions[sid];
+
+                /* Session may have been torn down while queued */
+                if (sess->state == SESS_UP &&
+                    route_outbound(m, sess) == 0) {
+                    send_pkt(LAN_PORT, m);
+                    g_bras.stat_pkts_tx++;
+                } else {
+                    g_bras.stat_drop_route++;
+                    drop_pkt(m, "drop:route");
+                }
+            } else {
+                if (route_inbound(m) == 0) {
+                    send_pkt(WAN_PORT, m);
+                    g_bras.stat_pkts_tx++;
+                } else {
+                    g_bras.stat_drop_route++;
+                    drop_pkt(m, "drop:route");
+                }
+            }
+        }
+
+        /* Return the (already transmitted) batch and request the next */
+        rte_distributor_request_pkt(dist, wid, bufs, n);
+    }
+    RTE_LOG(INFO, DP, "distributor worker %u stopping\n", wid);
+    return 0;
 }
 
 /* ── lcore workers ────────────────────────────────────────────────────── */
@@ -145,7 +426,7 @@ datapath_lcore(void *arg)
     RTE_LOG(INFO, DP, "data-path lcore %u started (queue %u)\n",
             rte_lcore_id(), queue_id);
 
-    while (1) {
+    while (g_running) {
         /* WAN (client side) */
         nb = rte_eth_rx_burst(WAN_PORT, queue_id, wan_pkts, BURST_SIZE);
         if (nb > 0)
@@ -156,6 +437,7 @@ datapath_lcore(void *arg)
         if (nb > 0)
             process_lan_burst(lan_pkts, nb);
     }
+    RTE_LOG(INFO, DP, "data-path lcore %u stopping\n", rte_lcore_id());
     return 0;
 }
 
@@ -169,26 +451,38 @@ ctrl_plane_lcore(void *arg __rte_unused)
 {
     void *obj;
     uint64_t last_timer = rte_rdtsc();
+    uint64_t last_arp   = 0;
     const uint64_t timer_interval = rte_get_timer_hz() * 10; /* 10 sec */
+    const uint64_t arp_interval   = rte_get_timer_hz();      /*  1 sec */
 
     RTE_LOG(INFO, DP, "control-plane lcore started (lcore %u)\n",
             rte_lcore_id());
 
-    while (1) {
+    while (g_running) {
+        /* Resolve the upstream next-hop MAC before traffic can flow */
+        if (!g_bras.upstream_mac_valid) {
+            uint64_t t = rte_rdtsc();
+            if (t - last_arp >= arp_interval) {
+                last_arp = t;
+                arp_request_upstream();
+            }
+        }
+
         /* Drain control ring */
         while (rte_ring_dequeue(g_bras.ctrl_ring, &obj) == 0) {
             struct rte_mbuf *m = (struct rte_mbuf *)obj;
 
             /* Re-classify: peek at ethertype to decide handler */
             uint8_t *p = rte_pktmbuf_mtod(m, uint8_t *);
-            struct rte_ether_hdr *eth = (struct rte_ether_hdr *)p;
-            uint16_t etype = ntohs(eth->ether_type);
+            uint16_t l2_len, vlan_tci;
+            uint16_t etype = bras_frame_ethertype(p, &l2_len, &vlan_tci);
+            (void)vlan_tci;
 
             if (etype == ETH_P_PPPoE_DISC) {
                 pppoe_handle_discovery(m);
             } else if (etype == ETH_P_PPPoE_SESS) {
                 struct pppoe_hdr *ph =
-                    (struct pppoe_hdr *)(p + sizeof(*eth));
+                    (struct pppoe_hdr *)(p + l2_len);
                 uint16_t sid = ntohs(ph->session_id);
                 ppp_handle_ctrl(m, sid);
             } else {
@@ -200,6 +494,8 @@ ctrl_plane_lcore(void *arg __rte_unused)
         uint64_t now = rte_rdtsc();
         if (now - last_timer >= timer_interval) {
             last_timer = now;
+
+            nat_expire();
 
             for (int i = 1; i <= MAX_SESSIONS; i++) {
                 struct bras_session *s = &g_bras.sessions[i];
@@ -218,8 +514,10 @@ ctrl_plane_lcore(void *arg __rte_unused)
                     (now - s->last_activity) > rte_get_timer_hz() * 30) {
                     /* Build LCP Echo-Request */
                     uint16_t pl = sizeof(struct lcp_hdr) + 4;
+                    uint16_t l2_len = sizeof(struct rte_ether_hdr) +
+                        (s->tx_vlan ? sizeof(struct rte_vlan_hdr) : 0);
                     struct rte_mbuf *em = alloc_pkt(
-                        sizeof(struct rte_ether_hdr) +
+                        l2_len +
                         sizeof(struct pppoe_hdr) +
                         sizeof(struct ppp_hdr) + pl);
                     if (em) {
@@ -229,8 +527,16 @@ ctrl_plane_lcore(void *arg __rte_unused)
                             (struct rte_ether_hdr *)ep;
                         rte_ether_addr_copy(&s->client_mac, &eeth->dst_addr);
                         rte_ether_addr_copy(&g_bras.wan_mac, &eeth->src_addr);
-                        eeth->ether_type = htons(ETH_P_PPPoE_SESS);
+                        eeth->ether_type =
+                            htons(s->tx_vlan ? ETH_P_8021Q : ETH_P_PPPoE_SESS);
                         ep += sizeof(*eeth);
+                        if (s->tx_vlan) {
+                            struct rte_vlan_hdr *vh =
+                                (struct rte_vlan_hdr *)ep;
+                            vh->vlan_tci = htons(s->vlan_tci);
+                            vh->eth_proto = htons(ETH_P_PPPoE_SESS);
+                            ep += sizeof(*vh);
+                        }
                         /* PPPoE */
                         struct pppoe_hdr *eph = (struct pppoe_hdr *)ep;
                         eph->ver_type = 0x11; eph->code = 0;
@@ -249,7 +555,7 @@ ctrl_plane_lcore(void *arg __rte_unused)
                         uint32_t magic_be = htonl(s->magic_number);
                         memcpy(ep + sizeof(*elcp), &magic_be, 4);
                         em->data_len = em->pkt_len =
-                            sizeof(struct rte_ether_hdr) +
+                            l2_len +
                             sizeof(struct pppoe_hdr) +
                             sizeof(struct ppp_hdr) + pl;
                         send_pkt(WAN_PORT, em);
@@ -257,16 +563,22 @@ ctrl_plane_lcore(void *arg __rte_unused)
                 }
             }
 
-            nat_expire();
-
             /* Stats log */
             RTE_LOG(INFO, DP,
-                    "stats: sessions_up=%lu rx=%lu tx=%lu drop=%lu\n",
+                    "stats: sessions_up=%lu rx=%lu tx=%lu drop=%lu "
+                    "(txfull=%lu dist=%lu route=%lu vlan=%lu) w0=%lu w1=%lu\n",
                     g_bras.stat_sessions_up,
                     g_bras.stat_pkts_rx,
                     g_bras.stat_pkts_tx,
-                    g_bras.stat_pkts_dropped);
+                    g_bras.stat_pkts_dropped,
+                    g_bras.stat_drop_txfull,
+                    g_bras.stat_drop_dist,
+                    g_bras.stat_drop_route,
+                    g_bras.stat_drop_vlan,
+                    g_bras.stat_worker_pkts[0],
+                    g_bras.stat_worker_pkts[1]);
         }
     }
+    RTE_LOG(INFO, DP, "control-plane lcore stopping\n");
     return 0;
 }

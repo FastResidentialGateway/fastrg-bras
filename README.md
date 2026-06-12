@@ -13,41 +13,21 @@ A minimal DPDK-based BRAS implementing:
 ## Test Topology
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│  Test Host (one machine with veth pairs or two NICs)      │
-│                                                          │
-│  ┌──────────────┐   eth0/veth0   ┌──────────────────┐   │
-│  │ fastrg-node  │◄──────────────►│  WAN port (DPDK) │   │
-│  │ (PPPoE client│                │                  │   │
+┌─────────────────────────────────────────────────────────┐
+│  Test Host (Use two DPDK capable NICs)                  │
+│                                                         │
+│  ┌──────────────┐   IPoPPPoE     ┌──────────────────┐   │
+│  │ fastrg-node  │◄──────────────►│  To downstream   │   │
+│  │  PPPoE client│                │  192.168.200.128 │   │
 │  │  multi-tenant│                │    dpdk-bras     │   │
 │  └──────────────┘                │                  │   │
-│                                  │  LAN port (DPDK) │   │
-│  ┌──────────────┐   eth1/veth1   │                  │   │
-│  │  Upstream    │◄──────────────►│                  │   │
+│                                  │                  │   │
+│  ┌──────────────┐   IPoE         │  To upstream     │   │
+│  │  Upstream    │◄──────────────►│  192.168.201.1   │   │
 │  │  Server      │                └──────────────────┘   │
-│  │ 192.168.100.1│                                        │
-└──────────────────────────────────────────────────────────┘
-```
-
-### Using Virtual Interfaces (no hardware NIC needed)
-
-```bash
-# Create veth pairs for testing
-ip link add veth-wan type veth peer name veth-wan-bras
-ip link add veth-lan type veth peer name veth-lan-bras
-
-ip link set veth-wan up
-ip link set veth-lan up
-ip link set veth-wan-bras up
-ip link set veth-lan-bras up
-
-# Bind veth pairs to DPDK (using net_af_packet driver — no vfio needed)
-# Then run with:
-sudo ./build/dpdk-bras \
-  -l 0-2 -n 4 \
-  --vdev "net_af_packet0,iface=veth-wan-bras" \
-  --vdev "net_af_packet1,iface=veth-lan-bras" \
-  -- --ip-pool 10.64.0.0
+│  │192.168.201.11│                                       │
+│  └──────────────┘                                       │
+└─────────────────────────────────────────────────────────┘
 ```
 
 ### fastrg-node Configuration (point at this BRAS)
@@ -64,29 +44,19 @@ NIC connected to dpdk-bras's WAN port. The BRAS will:
    - Session N → server `10.64.0.(N-1)*4+1`, client `+1`
 5. Route client data to upstream server via SNAT
 
-### Upstream Server
-
-```bash
-# On the upstream server machine (192.168.100.1):
-# Accept and reply to any IP traffic (e.g. simple echo):
-nc -lu 9999           # UDP echo test
-python3 -m http.server 8080   # HTTP test
-```
-
 ---
 
-## Build
+## Quick start
 
 ```bash
 # Install dependencies (Ubuntu/Debian)
 apt install dpdk dpdk-dev libnuma-dev meson ninja-build python3-pyelftools
 
-# Build
-meson setup build
-ninja -C build
+# build
+make
 
-# Run (with real NICs)
-./scripts/setup.sh
+# Example Run
+./dpdk-bras -l 0-5 -n 4 -- --pri-dns 192.168.10.1 --drop-pcap ./test.pcap --vlans 3,5
 ```
 
 ---
@@ -95,11 +65,25 @@ ninja -C build
 
 ### Lcore Assignment
 
+Two modes are selected automatically at startup based on available lcores and
+TX queue count.
+
+**Distributor mode** (default on real NICs; needs ≥ 4 lcores and ≥ 3 TX queues):
+
 | lcore | role |
 |-------|------|
-| 0 | main (init, stats, signal handling) |
-| 1 | `datapath_lcore` — RX/TX fast path, BURST_SIZE=32 |
-| 2 | `ctrl_plane_lcore` — PPPoE/LCP/IPCP state machines |
+| 0 | main — init, stats loop, signal handling |
+| 1 | `rx_dist_lcore` — polls WAN+LAN queue 0, classifies, tags by 5-tuple, fans out via `rte_distributor` |
+| 2 | `ctrl_plane_lcore` — drains `ctrl_ring`, runs PPPoE/PPP/IPCP state machines |
+| 3+ | `dist_worker_lcore` × N — NAT + forwarding, each with a dedicated TX queue |
+
+**Legacy mode** (fallback: < 4 lcores or single-queue vdevs like af_packet):
+
+| lcore | role |
+|-------|------|
+| 0 | main |
+| 1~N-1 | `datapath_lcore` — RX/classify/NAT inline |
+| N | `ctrl_plane_lcore` |
 
 ### Packet Classification (WAN RX)
 
@@ -109,7 +93,9 @@ WAN RX burst
   └── ethertype 0x8864 (PPPoE Session)
         ├── session not UP ──────────────► ctrl_ring ──► ppp_handle_ctrl()
         ├── PPP proto ≠ 0x0021 (ctrl) ───► ctrl_ring ──► ppp_handle_ctrl()
-        └── PPP proto = 0x0021 (IP data) ► nat_translate_outbound() ──► LAN TX
+        └── PPP proto = 0x0021 (IP data)
+              ├── distributor mode ───────► flow-tag + rte_distributor ──► worker: route_outbound() ──► LAN TX
+              └── legacy mode ────────────► route_outbound() inline ──► LAN TX
 ```
 
 ### NAT Flow
@@ -141,11 +127,12 @@ Inbound (upstream → PPPoE):
 
 - CHAP always succeeds (`chap_verify_response` returns 1) — replace with
   RADIUS or local credential lookup for real deployments.
-- Single TX queue per port — for multi-core scaling add per-lcore TX queues
-  and `rte_eth_tx_burst` with queue_id = lcore_id.
+- Per-worker TX queues are already implemented (distributor mode allocates
+  one TX queue per worker plus queue 0 for the RX lcore and queue N+1 for
+  the ctrl lcore); legacy mode still uses a single shared TX queue.
 - No IPv6CP.
-- NAT port allocation is round-robin without expiry scan — add a timer to
-  reclaim idle entries for long-running scenarios.
+- NAT entries are reclaimed by `nat_expire()` after 300 s of idle time;
+  the ctrl lcore calls it on a 10 s tick.
 
 ---
 
@@ -155,7 +142,7 @@ By default the BRAS pushes `1.1.1.1` (primary) and `8.8.8.8` (secondary) to
 every client via IPCP options 129/131. Override at startup:
 
 ```bash
-sudo ./build/dpdk-bras -l 0-2 -n 4 -- \
+./dpdk-bras -l 0-2 -n 4 -- \
   --ip-pool 10.64.0.0 \
   --pri-dns 9.9.9.9 \
   --sec-dns 149.112.112.112

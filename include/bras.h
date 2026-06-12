@@ -2,25 +2,37 @@
 #define BRAS_H
 
 #include <stdint.h>
+#include <stdio.h>
 #include <rte_ether.h>
+#include <rte_pcapng.h>
 #include <rte_ip.h>
 #include <rte_hash.h>
 #include <rte_ring.h>
 #include <rte_mempool.h>
 #include <rte_mbuf.h>
 #include <rte_lcore.h>
+#include <rte_byteorder.h>
 
 /* =====================================================================
  * BRAS Configuration
  * ===================================================================== */
 #define MAX_SESSIONS        4094        /* PPPoE max session IDs */
-#define MAX_NAT_ENTRIES     65536
-#define NAT_PUBLIC_IP       RTE_IPV4(203, 0, 113, 1)   /* change to your IP */
-#define UPSTREAM_SERVER_IP  RTE_IPV4(192, 168, 100, 1)
-#define UPSTREAM_GW_MAC     { 0xAA,0xBB,0xCC,0xDD,0xEE,0xFF } /* upstream GW MAC */
 
-#define WAN_PORT            0           /* DPDK port facing fastrg-node */
-#define LAN_PORT            1           /* DPDK port facing upstream server */
+/* Lab topology defaults — all overridable via CLI options after the EAL "--".
+ *
+ *   WAN_PORT (07:00.0): PPPoE terminal. Our PPP endpoint = 192.168.200.128,
+ *     clients get 192.168.200.130 … 192.168.200.254 (within /25).
+ *   LAN_PORT (08:00.0): mock backbone. We own 192.168.201.1/24 (SNAT exit IP),
+ *     all NATed traffic is routed to the peer 192.168.201.11.
+ */
+#define DEFAULT_PPP_LOCAL_IP   RTE_IPV4(192, 168, 200, 128)
+#define DEFAULT_IP_POOL_START  RTE_IPV4(192, 168, 200, 130)
+#define DEFAULT_IP_POOL_END    RTE_IPV4(192, 168, 200, 254)
+#define DEFAULT_NAT_PUBLIC_IP  RTE_IPV4(192, 168, 201, 1)
+#define DEFAULT_UPSTREAM_IP    RTE_IPV4(192, 168, 201, 11)
+
+#define WAN_PORT            0           /* DPDK port facing fastrg-node (07:00.0) */
+#define LAN_PORT            1           /* DPDK port facing upstream backbone (08:00.0) */
 #define BURST_SIZE          32
 #define MBUF_POOL_SIZE      8191
 #define MBUF_CACHE_SIZE     256
@@ -29,12 +41,14 @@
 
 /* LCore assignment */
 #define LCORE_CTRL          2           /* control plane: PPPoE/LCP/IPCP */
+#define MAX_DIST_WORKERS    8           /* max distributor worker lcores */
 
 /* =====================================================================
  * PPPoE Protocol Constants  (RFC 2516)
  * ===================================================================== */
 #define ETH_P_PPPoE_DISC    0x8863
 #define ETH_P_PPPoE_SESS    0x8864
+#define ETH_P_8021Q         0x8100
 
 #define PPPOE_CODE_PADI     0x09
 #define PPPOE_CODE_PADO     0x07
@@ -161,6 +175,11 @@ struct bras_session {
     uint16_t            session_id;
     struct rte_ether_addr client_mac;
     struct rte_ether_addr server_mac;  /* our WAN port MAC */
+    uint8_t             has_vlan;      /* fastrg-node uses 802.1Q PPPoE */
+    uint8_t             tx_vlan;       /* insert 802.1Q tag on TX; 0 when the
+                                        * PF enforces a port VLAN (VMVIR) and
+                                        * inserts the tag in hardware itself */
+    uint16_t            vlan_tci;      /* host order, includes PCP/DEI/VID */
 
     /* PPP negotiation state */
     auth_method_t       auth_method;
@@ -190,20 +209,6 @@ struct bras_session {
 };
 
 /* =====================================================================
- * NAT table entry
- * ===================================================================== */
-struct nat_entry {
-    uint8_t     in_use;
-    uint8_t     proto;
-    uint16_t    session_id;  /* back-reference */
-    uint32_t    inner_ip;
-    uint16_t    inner_port;
-    uint32_t    outer_ip;    /* NAT_PUBLIC_IP */
-    uint16_t    outer_port;
-    uint64_t    last_seen;
-};
-
-/* =====================================================================
  * Control message passed from fast-path to control-plane lcore
  * ===================================================================== */
 typedef enum {
@@ -218,6 +223,26 @@ struct ctrl_msg {
 };
 
 /* =====================================================================
+ * NAT table entry — internet-bound flows only.
+ * Backbone-local traffic (dst within the LAN /24) is routed transparently;
+ * everything else is SNATed to nat_public_ip because the WAN host's
+ * firewall only forwards/masquerades the LAN net to the internet, not the
+ * subscriber pool.
+ * ===================================================================== */
+#define MAX_NAT_ENTRIES     65536
+
+struct nat_entry {
+    uint8_t     in_use;
+    uint8_t     proto;
+    uint32_t    inner_ip;    /* host order */
+    uint16_t    inner_port;  /* host order; ICMP echo: ident */
+    uint32_t    outer_ip;    /* host order */
+    uint16_t    outer_port;  /* host order */
+    uint16_t    session_id;
+    uint64_t    last_seen;   /* rte_rdtsc() */
+};
+
+/* =====================================================================
  * Global BRAS context
  * ===================================================================== */
 struct bras_ctx {
@@ -227,11 +252,6 @@ struct bras_ctx {
     /* Packet pools */
     struct rte_mempool *pktmbuf_pool;
 
-    /* NAT hash: key=(inner_ip, inner_port, proto), val=nat_entry* */
-    struct rte_hash    *nat_out_tbl;   /* outbound lookup */
-    struct rte_hash    *nat_in_tbl;    /* inbound lookup (outer port) */
-    struct nat_entry    nat_entries[MAX_NAT_ENTRIES];
-
     /* Ring from fast-path to control plane */
     struct rte_ring    *ctrl_ring;
 
@@ -239,8 +259,28 @@ struct bras_ctx {
     struct rte_ether_addr wan_mac;
     struct rte_ether_addr lan_mac;
 
-    /* IP pool for clients: base + offset per session */
-    uint32_t            ip_pool_base;  /* e.g. 10.0.0.0 */
+    /* PPP addressing: fixed server endpoint + linear client pool (inclusive) */
+    uint32_t            ppp_local_ip;  /* our PPP endpoint, e.g. 192.168.200.128 */
+    uint32_t            ip_pool_start; /* first client IP, e.g. 192.168.200.130 */
+    uint32_t            ip_pool_end;   /* last  client IP, e.g. 192.168.200.254 */
+
+    /* LAN-side addressing: our LAN IP (ARP/ICMP responder) + next-hop */
+    uint32_t            nat_public_ip; /* our IP on the LAN net (gateway for
+                                        * the subscriber pool route)         */
+    uint32_t            upstream_ip;   /* next-hop for all outbound traffic   */
+    struct rte_ether_addr upstream_mac;      /* learned via ARP */
+    volatile uint8_t      upstream_mac_valid;
+
+    /* Extra unicast MAC accepted on LAN RX (e2e bench injects frames
+     * addressed to the fastrg-node WAN MAC; VF promiscuous is unavailable
+     * without PF trust, so we add it as a second MAC filter). */
+    struct rte_ether_addr lan_alias_mac;
+    uint8_t               lan_alias_mac_set;
+
+    /* NAT tables (internet-bound flows only — see struct nat_entry) */
+    struct rte_hash    *nat_out_tbl;   /* (inner_ip, inner_port, proto) → outer_port */
+    struct rte_hash    *nat_in_tbl;    /* (outer_port, proto) → entry */
+    struct nat_entry    nat_entries[MAX_NAT_ENTRIES];
 
     /* DNS servers pushed to clients via IPCP options 129/131 (RFC 1877) */
     uint32_t            pri_dns;
@@ -250,15 +290,85 @@ struct bras_ctx {
     uint16_t            n_queues;
     uint16_t            lcore_queue[RTE_MAX_LCORE];
 
+    /* Software distributor datapath (X520/82599 VF cannot RSS PPPoE: the
+     * inner IP is hidden behind the PPPoE header, so hardware always lands
+     * every session frame on queue 0).  One RX lcore classifies and tags
+     * data packets by flow 5-tuple; N worker lcores do NAT + forwarding,
+     * each on its own TX queue.  NULL = legacy single-lcore datapath. */
+    struct rte_distributor *dist;
+    uint16_t            n_workers;
+
+    /* VLANs registered with the WAN port (82599 VF needs PF-side VLVF
+     * membership via mailbox before it may TX tagged frames). */
+    uint8_t             vlan_registered[4096];
+
+    /* Accepted PPPoE VLAN set (--vlans).  When vlan_filter_enabled, a PPPoE
+     * frame is accepted only if it is tagged and its VID has vlan_allowed[]
+     * set; otherwise it is dropped (drop:vlan).  Disabled = accept any. */
+    uint8_t             vlan_allowed[4096];
+    uint8_t             vlan_filter_enabled;
+
     /* Statistics */
     uint64_t            stat_sessions_up;
     uint64_t            stat_pkts_rx;
     uint64_t            stat_pkts_tx;
     uint64_t            stat_pkts_dropped;
+    uint64_t            stat_worker_pkts[MAX_DIST_WORKERS];
+
+    /* Drop forensics: every dropped data packet is copied to this pcapng
+     * file (with a per-packet "drop:<reason>" comment) before being freed
+     * (--drop-pcap <file>[,<max>]; NULL = disabled).  Full-traffic capture
+     * is separate — attach dpdk-dumpcap at runtime (rte_pdump_init). */
+    rte_pcapng_t       *drop_pcap;
+    struct rte_mempool *drop_pcap_pool;  /* pcapng copy buffers */
+    uint64_t            drop_pcap_max;   /* byte cap (<= 2 GiB), 0 = until cap */
+    uint64_t            drop_pcap_bytes; /* bytes written so far */
+
+    /* Drop reason breakdown (sum == stat_pkts_dropped for data drops) */
+    uint64_t            stat_drop_txfull;  /* rte_eth_tx_burst returned 0  */
+    uint64_t            stat_drop_dist;    /* distributor backlog refused  */
+    uint64_t            stat_drop_route;   /* route_outbound/inbound == -1 */
+    uint64_t            stat_drop_other;   /* unknown ethertype etc.       */
+    uint64_t            stat_drop_vlan;    /* PPPoE VLAN not in --vlans set */
 };
 
 /* Singleton — defined in main.c */
 extern struct bras_ctx g_bras;
+
+/* Set by the signal handler; worker lcores poll this to exit cleanly. */
+extern volatile int g_running;
+
+/* Return the real ethertype after an optional single 802.1Q VLAN header. */
+static inline uint16_t
+bras_frame_ethertype(const uint8_t *p, uint16_t *l2_len, uint16_t *vlan_tci)
+{
+    const struct rte_ether_hdr *eth = (const struct rte_ether_hdr *)p;
+    uint16_t etype = rte_be_to_cpu_16(eth->ether_type);
+
+    *l2_len = sizeof(struct rte_ether_hdr);
+    *vlan_tci = 0;
+    if (etype == ETH_P_8021Q) {
+        const struct rte_vlan_hdr *vh =
+            (const struct rte_vlan_hdr *)(p + sizeof(struct rte_ether_hdr));
+        *l2_len += sizeof(struct rte_vlan_hdr);
+        *vlan_tci = rte_be_to_cpu_16(vh->vlan_tci);
+        etype = rte_be_to_cpu_16(vh->eth_proto);
+    }
+    return etype;
+}
+
+/* Return 1 if a PPPoE frame with this L2 framing passes the --vlans filter.
+ * Always 1 when the filter is disabled; when enabled, only tagged frames
+ * whose VID is in the allowed set are accepted (untagged → 0). */
+static inline int
+bras_vlan_accepted(uint16_t l2_len, uint16_t vlan_tci)
+{
+    if (!g_bras.vlan_filter_enabled)
+        return 1;
+    if (l2_len <= sizeof(struct rte_ether_hdr))
+        return 0;  /* untagged PPPoE rejected when the filter is on */
+    return g_bras.vlan_allowed[vlan_tci & 0x0FFF];
+}
 
 /* =====================================================================
  * Function prototypes
@@ -280,20 +390,30 @@ int  chap_verify_response(struct bras_session *sess, uint8_t *payload, uint16_t 
 void ipcp_send_conf_req(struct bras_session *sess);
 void ipcp_send_conf_ack(struct bras_session *sess, uint8_t id, uint32_t client_ip);
 
-/* nat.c */
-int  nat_translate_outbound(struct rte_mbuf *mbuf, struct bras_session *sess);
-int  nat_translate_inbound(struct rte_mbuf *mbuf);
+/* nat.c — hybrid forwarding: backbone-local routed, internet-bound SNATed */
+int  route_outbound(struct rte_mbuf *mbuf, struct bras_session *sess);
+int  route_inbound(struct rte_mbuf *mbuf);
 void nat_init(void);
 void nat_expire(void);
 void nat_flush_session(uint16_t session_id);
 
 /* datapath.c */
 int  datapath_lcore(void *arg);
+int  rx_dist_lcore(void *arg);
+int  dist_worker_lcore(void *arg);
 int  ctrl_plane_lcore(void *arg);
+
+/* arp.c — LAN-side ARP + local ICMP echo responder */
+void arp_input(struct rte_mbuf *mbuf);          /* consumes mbuf */
+void arp_request_upstream(void);
+int  lan_icmp_echo_input(struct rte_mbuf *mbuf); /* 0 = consumed */
 
 /* utils.c */
 struct rte_mbuf *alloc_pkt(uint16_t data_room);
 void             send_pkt(uint16_t port, struct rte_mbuf *mbuf);
+void             drop_capture(struct rte_mbuf *mbuf, uint16_t port,
+                              enum rte_pcapng_direction dir,
+                              const char *reason);
 uint16_t         alloc_session_id(void);
 void             free_session(uint16_t session_id);
 uint32_t         session_alloc_ip(uint16_t session_id);
