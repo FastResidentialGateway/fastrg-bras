@@ -194,6 +194,24 @@ lcp_send_term_ack(struct bras_session *sess, uint8_t id)
     free_session(sess->session_id);
 }
 
+static void
+ipcp_send_term_ack(struct bras_session *sess, uint8_t id)
+{
+    uint16_t payload_len = sizeof(struct lcp_hdr);
+    struct rte_mbuf *m;
+    uint8_t *p = begin_ppp_frame(&m, sess, PPP_IPCP, payload_len);
+    if (!p) return;
+
+    struct lcp_hdr *lcp = (struct lcp_hdr *)p;
+    lcp->code       = LCP_TERM_ACK;
+    lcp->identifier = id;
+    lcp->length     = htons(payload_len);
+
+    finish_and_send(m);
+    RTE_LOG(INFO, PPP, "[%u] IPCP TERM_ACK sent\n", sess->session_id);
+    /* Do NOT free_session here — LCP Terminate-Request will follow */
+}
+
 /* ── CHAP ─────────────────────────────────────────────────────────────── */
 
 void
@@ -592,6 +610,10 @@ ppp_handle_ctrl(struct rte_mbuf *mbuf, uint16_t session_id)
                     (sess->client_ip      ) & 0xFF);
             sess->state = SESS_UP;
             g_bras.stat_sessions_up++;
+            break;
+        case LCP_TERM_REQ:
+            RTE_LOG(INFO, PPP, "[%u] IPCP TERM_REQ from client\n", session_id);
+            ipcp_send_term_ack(sess, lcp->identifier);
             break;
         default:
             break;
