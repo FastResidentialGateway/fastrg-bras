@@ -386,6 +386,7 @@ void lcp_send_conf_req(struct bras_session *sess);
 void lcp_send_conf_ack(struct bras_session *sess, struct lcp_hdr *req, uint16_t len);
 void lcp_send_term_ack(struct bras_session *sess, uint8_t id);
 void chap_send_challenge(struct bras_session *sess);
+void chap_retry_pending(uint64_t now);
 int  chap_verify_response(struct bras_session *sess, uint8_t *payload, uint16_t len);
 void ipcp_send_conf_req(struct bras_session *sess);
 void ipcp_send_conf_ack(struct bras_session *sess, uint8_t id, uint32_t client_ip);

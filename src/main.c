@@ -44,6 +44,7 @@
 
 /* ── global BRAS context ──────────────────────────────────────────────── */
 struct bras_ctx g_bras;
+auth_method_t g_default_auth_method = AUTH_PAP;
 
 /* ── port configuration ───────────────────────────────────────────────── */
 
@@ -424,6 +425,7 @@ usage(const char *prog)
         "  --upstream-ip <IP>  LAN next-hop          (default 192.168.201.11)\n"
         "  --pri-dns <IP>      Primary DNS via IPCP  (default 1.1.1.1)\n"
         "  --sec-dns <IP>      Secondary DNS via IPCP(default 8.8.8.8)\n"
+        "  --auth <pap|chap>   PPP authentication    (default pap)\n"
         "  --lan-alias-mac <M> Extra unicast MAC accepted on LAN RX\n"
         "                      (default 74:4D:28:8D:00:2C — the e2e bench\n"
         "                       injects frames addressed to the fastrg-node\n"
@@ -488,12 +490,30 @@ main(int argc, char *argv[])
         { "upstream-ip",   required_argument, NULL, 'u' },
         { "pri-dns",       required_argument, NULL, '1' },
         { "sec-dns",       required_argument, NULL, '2' },
+        { "auth",          required_argument, NULL, 'a' },
         { "lan-alias-mac", required_argument, NULL, 'm' },
         { "drop-pcap",     required_argument, NULL, 'D' },
         { "vlans",         required_argument, NULL, 'V' },
+        { "help",          no_argument,       NULL, 'h' },
         { NULL, 0, NULL, 0 }
     };
     while ((opt = getopt_long(argc, argv, "", long_opts, NULL)) != -1) {
+        if (opt == 'h') {
+            usage(argv[0]);
+            return 0;
+        }
+        if (opt == 'a') {
+            if (strcmp(optarg, "pap") == 0)
+                g_default_auth_method = AUTH_PAP;
+            else if (strcmp(optarg, "chap") == 0)
+                g_default_auth_method = AUTH_CHAP;
+            else {
+                fprintf(stderr, "Bad --auth mode: %s (expected pap or chap)\n",
+                        optarg);
+                return 1;
+            }
+            continue;
+        }
         if (opt == 'V') {
             if (parse_vlan_spec(optarg) != 0) {
                 fprintf(stderr, "Bad --vlans spec: %s\n", optarg);

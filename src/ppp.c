@@ -32,6 +32,14 @@
 #include "bras.h"
 
 #define RTE_LOGTYPE_PPP RTE_LOGTYPE_USER2
+#define CHAP_RETRY_INTERVAL_SEC 3
+#define CHAP_MAX_ATTEMPTS      10
+
+extern auth_method_t g_default_auth_method;
+
+static uint64_t chap_challenge_sent_at[MAX_SESSIONS + 1];
+static uint8_t chap_challenge_attempts[MAX_SESSIONS + 1];
+static uint64_t chap_last_retry_scan;
 
 /* ── frame building helpers ───────────────────────────────────────────── */
 
@@ -98,14 +106,14 @@ finish_and_send(struct rte_mbuf *m)
 
 /*
  * lcp_send_conf_req — server initiates LCP: MRU=1488, auth=PAP or CHAP, magic.
- * Reads sess->auth_method (defaults to PAP on first call).
+ * Reads sess->auth_method (defaults to the CLI-selected method on first call).
  * CHAP auth option is 5 bytes (type+len+proto+algo); PAP is 4 bytes.
  */
 void
 lcp_send_conf_req(struct bras_session *sess)
 {
     if (sess->auth_method == AUTH_NONE)
-        sess->auth_method = AUTH_PAP;
+        sess->auth_method = g_default_auth_method;
 
     /* CHAP option carries an extra algorithm byte (0x05 = MD5) */
     uint16_t auth_opt_len = (sess->auth_method == AUTH_CHAP) ? 5 : 4;
@@ -214,10 +222,9 @@ ipcp_send_term_ack(struct bras_session *sess, uint8_t id)
 
 /* ── CHAP ─────────────────────────────────────────────────────────────── */
 
-void
-chap_send_challenge(struct bras_session *sess)
+static void
+chap_send_challenge_packet(struct bras_session *sess)
 {
-    /* Challenge: 16 random bytes */
     static const char name[] = "dpdk-bras";
     uint8_t name_len = strlen(name);
     uint8_t challen_len = 16;
@@ -228,13 +235,6 @@ chap_send_challenge(struct bras_session *sess)
     struct rte_mbuf *m;
     uint8_t *p = begin_ppp_frame(&m, sess, PPP_CHAP, payload_len);
     if (!p) return;
-
-    /* Generate challenge */
-    for (int i = 0; i < 16; i += 8) {
-        uint64_t r = rte_rand();
-        memcpy(&sess->chap_challenge[i], &r, 8);
-    }
-    sess->chap_id = ++sess->lcp_id;
 
     p[0] = CHAP_CHALLENGE;
     p[1] = sess->chap_id;
@@ -247,6 +247,48 @@ chap_send_challenge(struct bras_session *sess)
     sess->state = SESS_AUTH_PENDING;
     finish_and_send(m);
     RTE_LOG(DEBUG, PPP, "[%u] CHAP Challenge sent\n", sess->session_id);
+}
+
+void
+chap_send_challenge(struct bras_session *sess)
+{
+    /* Challenge: 16 random bytes */
+    for (int i = 0; i < 16; i += 8) {
+        uint64_t r = rte_rand();
+        memcpy(&sess->chap_challenge[i], &r, 8);
+    }
+    sess->chap_id = ++sess->lcp_id;
+    chap_challenge_attempts[sess->session_id] = 1;
+    chap_challenge_sent_at[sess->session_id] = rte_rdtsc();
+    chap_send_challenge_packet(sess);
+}
+
+void
+chap_retry_pending(uint64_t now)
+{
+    uint64_t hz = rte_get_timer_hz();
+
+    if (now - chap_last_retry_scan < hz)
+        return;
+    chap_last_retry_scan = now;
+
+    for (uint16_t sid = 1; sid <= MAX_SESSIONS; sid++) {
+        struct bras_session *sess = &g_bras.sessions[sid];
+        uint8_t attempts = chap_challenge_attempts[sid];
+
+        if (sess->state != SESS_AUTH_PENDING ||
+            sess->auth_method != AUTH_CHAP || attempts == 0 ||
+            attempts >= CHAP_MAX_ATTEMPTS ||
+            now - chap_challenge_sent_at[sid] <
+                hz * CHAP_RETRY_INTERVAL_SEC)
+            continue;
+
+        chap_challenge_attempts[sid]++;
+        chap_challenge_sent_at[sid] = now;
+        chap_send_challenge_packet(sess);
+        RTE_LOG(INFO, PPP, "[%u] CHAP Challenge retry %u/%u\n",
+                sid, chap_challenge_attempts[sid], CHAP_MAX_ATTEMPTS);
+    }
 }
 
 /*
@@ -449,6 +491,8 @@ ppp_handle_ctrl(struct rte_mbuf *mbuf, uint16_t session_id)
     /* ── CHAP ─────────────────────────────────────────────────────── */
     case PPP_CHAP:
         if (lcp->code == CHAP_RESPONSE) {
+            chap_challenge_attempts[session_id] = 0;
+            chap_challenge_sent_at[session_id] = 0;
             int ok = chap_verify_response(sess,
                          (uint8_t *)lcp + sizeof(struct lcp_hdr),
                          lcp_len - sizeof(struct lcp_hdr));

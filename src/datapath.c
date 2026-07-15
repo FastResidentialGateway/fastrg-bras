@@ -492,6 +492,7 @@ ctrl_plane_lcore(void *arg __rte_unused)
 
         /* Periodic tasks */
         uint64_t now = rte_rdtsc();
+        chap_retry_pending(now);
         if (now - last_timer >= timer_interval) {
             last_timer = now;
 
