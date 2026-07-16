@@ -34,12 +34,39 @@
 #define RTE_LOGTYPE_PPP RTE_LOGTYPE_USER2
 #define CHAP_RETRY_INTERVAL_SEC 3
 #define CHAP_MAX_ATTEMPTS      10
+#define PPP_IPV6CP              0x8057
+#define PPP_MPLSCP              0x8281
+#define LCP_PROTO_REJ           8
+#define NCP_RETRY_INTERVAL_SEC  3
+#define NCP_MAX_ATTEMPTS        10
+#define NCP_INJECT_IPV6CP       (1u << 0)
+#define NCP_INJECT_MPLSCP       (1u << 1)
 
 extern auth_method_t g_default_auth_method;
 
 static uint64_t chap_challenge_sent_at[MAX_SESSIONS + 1];
 static uint8_t chap_challenge_attempts[MAX_SESSIONS + 1];
 static uint64_t chap_last_retry_scan;
+static uint8_t ncp_inject_mask;
+static uint64_t ncp_sent_at[2][MAX_SESSIONS + 1];
+static uint8_t ncp_attempts[2][MAX_SESSIONS + 1];
+static uint8_t ncp_stopped[MAX_SESSIONS + 1];
+
+int
+ncp_injection_configure(const char *spec)
+{
+    if (strcmp(spec, "ipv6cp") == 0) {
+        ncp_inject_mask = NCP_INJECT_IPV6CP;
+    } else if (strcmp(spec, "mplscp") == 0) {
+        ncp_inject_mask = NCP_INJECT_MPLSCP;
+    } else if (strcmp(spec, "ipv6cp,mplscp") == 0 ||
+               strcmp(spec, "mplscp,ipv6cp") == 0) {
+        ncp_inject_mask = NCP_INJECT_IPV6CP | NCP_INJECT_MPLSCP;
+    } else {
+        return -1;
+    }
+    return 0;
+}
 
 /* ── frame building helpers ───────────────────────────────────────────── */
 
@@ -100,6 +127,60 @@ static void
 finish_and_send(struct rte_mbuf *m)
 {
     send_pkt(WAN_PORT, m);
+}
+
+static int
+ncp_send_conf_req(struct bras_session *sess, uint16_t proto,
+                  uint8_t identifier)
+{
+    struct rte_mbuf *m;
+    uint8_t *p = begin_ppp_frame(&m, sess, proto, sizeof(struct lcp_hdr));
+    if (!p)
+        return -1;
+
+    struct lcp_hdr *ncp = (struct lcp_hdr *)p;
+    ncp->code = IPCP_CONF_REQ;
+    ncp->identifier = identifier;
+    ncp->length = htons(sizeof(struct lcp_hdr));
+    finish_and_send(m);
+    return 0;
+}
+
+static void
+ncp_inject_pending(uint64_t now, uint64_t hz)
+{
+    static const uint16_t protos[] = { PPP_IPV6CP, PPP_MPLSCP };
+    static const char *names[] = { "IPV6CP", "MPLSCP" };
+
+    if (ncp_inject_mask == 0)
+        return;
+
+    for (uint16_t sid = 1; sid <= MAX_SESSIONS; sid++) {
+        struct bras_session *sess = &g_bras.sessions[sid];
+        if (sess->state != SESS_UP)
+            continue;
+
+        for (uint8_t idx = 0; idx < 2; idx++) {
+            uint8_t bit = (uint8_t)(1u << idx);
+            uint8_t attempts = ncp_attempts[idx][sid];
+
+            if (!(ncp_inject_mask & bit) || (ncp_stopped[sid] & bit) ||
+                attempts >= NCP_MAX_ATTEMPTS ||
+                (attempts > 0 && now - ncp_sent_at[idx][sid] <
+                    hz * NCP_RETRY_INTERVAL_SEC))
+                continue;
+
+            if (ncp_send_conf_req(sess, protos[idx], attempts + 1) != 0)
+                continue;
+
+            ncp_attempts[idx][sid]++;
+            ncp_sent_at[idx][sid] = now;
+            RTE_LOG(INFO, PPP,
+                    "[%u] %s Config-Request sent for 0x%04x (%u/%u)\n",
+                    sid, names[idx], protos[idx], ncp_attempts[idx][sid],
+                    NCP_MAX_ATTEMPTS);
+        }
+    }
 }
 
 /* ── LCP ──────────────────────────────────────────────────────────────── */
@@ -289,6 +370,8 @@ chap_retry_pending(uint64_t now)
         RTE_LOG(INFO, PPP, "[%u] CHAP Challenge retry %u/%u\n",
                 sid, chap_challenge_attempts[sid], CHAP_MAX_ATTEMPTS);
     }
+
+    ncp_inject_pending(now, hz);
 }
 
 /*
@@ -472,6 +555,30 @@ ppp_handle_ctrl(struct rte_mbuf *mbuf, uint16_t session_id)
             lcp_send_term_ack(sess, lcp->identifier);
             break;
 
+        case LCP_PROTO_REJ:
+            if (lcp_len >= sizeof(struct lcp_hdr) + sizeof(uint16_t)) {
+                uint16_t rejected_proto;
+                memcpy(&rejected_proto,
+                       (uint8_t *)lcp + sizeof(struct lcp_hdr),
+                       sizeof(rejected_proto));
+                rejected_proto = ntohs(rejected_proto);
+
+                if (rejected_proto == PPP_IPV6CP) {
+                    ncp_stopped[session_id] |= NCP_INJECT_IPV6CP;
+                    RTE_LOG(INFO, PPP,
+                            "[%u] Protocol-Reject received for 0x8057 — "
+                            "stopping IPV6CP\n",
+                            session_id);
+                } else if (rejected_proto == PPP_MPLSCP) {
+                    ncp_stopped[session_id] |= NCP_INJECT_MPLSCP;
+                    RTE_LOG(INFO, PPP,
+                            "[%u] Protocol-Reject received for 0x8281 — "
+                            "stopping MPLSCP\n",
+                            session_id);
+                }
+            }
+            break;
+
         case LCP_ECHO_REQ: {
             /* Reflect as ECHO_REP */
             struct rte_mbuf *m;
@@ -652,6 +759,13 @@ ppp_handle_ctrl(struct rte_mbuf *mbuf, uint16_t session_id)
                     (sess->client_ip >> 16) & 0xFF,
                     (sess->client_ip >>  8) & 0xFF,
                     (sess->client_ip      ) & 0xFF);
+            if (sess->state != SESS_UP) {
+                for (uint8_t idx = 0; idx < 2; idx++) {
+                    ncp_attempts[idx][session_id] = 0;
+                    ncp_sent_at[idx][session_id] = 0;
+                }
+                ncp_stopped[session_id] = 0;
+            }
             sess->state = SESS_UP;
             g_bras.stat_sessions_up++;
             break;

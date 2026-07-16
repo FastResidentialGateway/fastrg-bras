@@ -46,6 +46,9 @@
 struct bras_ctx g_bras;
 auth_method_t g_default_auth_method = AUTH_PAP;
 
+/* ppp.c owns the injection state; main only exposes the CLI switch. */
+int ncp_injection_configure(const char *spec);
+
 /* ── port configuration ───────────────────────────────────────────────── */
 
 static int
@@ -426,6 +429,9 @@ usage(const char *prog)
         "  --pri-dns <IP>      Primary DNS via IPCP  (default 1.1.1.1)\n"
         "  --sec-dns <IP>      Secondary DNS via IPCP(default 8.8.8.8)\n"
         "  --auth <pap|chap>   PPP authentication    (default pap)\n"
+        "  --inject-ncp <spec> Inject unsupported NCP Config-Requests after\n"
+        "                      IPCP is up (ipv6cp, mplscp, or both comma-\n"
+        "                      separated).  Default: off.\n"
         "  --lan-alias-mac <M> Extra unicast MAC accepted on LAN RX\n"
         "                      (default 74:4D:28:8D:00:2C — the e2e bench\n"
         "                       injects frames addressed to the fastrg-node\n"
@@ -491,6 +497,7 @@ main(int argc, char *argv[])
         { "pri-dns",       required_argument, NULL, '1' },
         { "sec-dns",       required_argument, NULL, '2' },
         { "auth",          required_argument, NULL, 'a' },
+        { "inject-ncp",    required_argument, NULL, 'N' },
         { "lan-alias-mac", required_argument, NULL, 'm' },
         { "drop-pcap",     required_argument, NULL, 'D' },
         { "vlans",         required_argument, NULL, 'V' },
@@ -509,6 +516,16 @@ main(int argc, char *argv[])
                 g_default_auth_method = AUTH_CHAP;
             else {
                 fprintf(stderr, "Bad --auth mode: %s (expected pap or chap)\n",
+                        optarg);
+                return 1;
+            }
+            continue;
+        }
+        if (opt == 'N') {
+            if (ncp_injection_configure(optarg) != 0) {
+                fprintf(stderr,
+                        "Bad --inject-ncp spec: %s (expected ipv6cp, mplscp, "
+                        "or ipv6cp,mplscp)\n",
                         optarg);
                 return 1;
             }
