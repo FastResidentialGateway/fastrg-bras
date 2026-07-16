@@ -459,6 +459,24 @@ ctrl_plane_lcore(void *arg __rte_unused)
             rte_lcore_id());
 
     while (g_running) {
+        if (g_terminate_sessions) {
+            g_terminate_sessions = 0;
+            for (int i = 1; i <= MAX_SESSIONS; i++) {
+                struct bras_session *s = &g_bras.sessions[i];
+                if (s->state == SESS_UP)
+                    lcp_send_term_req(s);
+            }
+        }
+
+        if (g_padt_sessions) {
+            g_padt_sessions = 0;
+            for (int i = 1; i <= MAX_SESSIONS; i++) {
+                struct bras_session *s = &g_bras.sessions[i];
+                if (s->state == SESS_UP)
+                    pppoe_send_padt(s);
+            }
+        }
+
         /* Resolve the upstream next-hop MAC before traffic can flow */
         if (!g_bras.upstream_mac_valid) {
             uint64_t t = rte_rdtsc();
@@ -511,7 +529,7 @@ ctrl_plane_lcore(void *arg __rte_unused)
                 }
 
                 /* LCP echo-request every 30 seconds for UP sessions */
-                if (s->state == SESS_UP &&
+                if (!g_no_lcp_echo && s->state == SESS_UP &&
                     (now - s->last_activity) > rte_get_timer_hz() * 30) {
                     /* Build LCP Echo-Request */
                     uint16_t pl = sizeof(struct lcp_hdr) + 4;

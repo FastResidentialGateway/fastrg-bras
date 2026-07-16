@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <signal.h>
 #include <rte_ether.h>
 #include <rte_pcapng.h>
 #include <rte_ip.h>
@@ -337,6 +338,9 @@ extern struct bras_ctx g_bras;
 
 /* Set by the signal handler; worker lcores poll this to exit cleanly. */
 extern volatile int g_running;
+extern volatile sig_atomic_t g_terminate_sessions;
+extern volatile sig_atomic_t g_padt_sessions;
+extern int g_no_lcp_echo;
 
 /* Return the real ethertype after an optional single 802.1Q VLAN header. */
 static inline uint16_t
@@ -384,6 +388,7 @@ void pppoe_send_padt(struct bras_session *sess);
 void ppp_handle_ctrl(struct rte_mbuf *mbuf, uint16_t session_id);
 void lcp_send_conf_req(struct bras_session *sess);
 void lcp_send_conf_ack(struct bras_session *sess, struct lcp_hdr *req, uint16_t len);
+void lcp_send_term_req(struct bras_session *sess);
 void lcp_send_term_ack(struct bras_session *sess, uint8_t id);
 void chap_send_challenge(struct bras_session *sess);
 void chap_retry_pending(uint64_t now);

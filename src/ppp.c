@@ -267,6 +267,25 @@ lcp_send_conf_ack(struct bras_session *sess, struct lcp_hdr *req, uint16_t len)
 }
 
 void
+lcp_send_term_req(struct bras_session *sess)
+{
+    uint16_t payload_len = sizeof(struct lcp_hdr);
+    struct rte_mbuf *m;
+    uint8_t *p = begin_ppp_frame(&m, sess, PPP_LCP, payload_len);
+    if (!p) return;
+
+    struct lcp_hdr *lcp = (struct lcp_hdr *)p;
+    lcp->code       = LCP_TERM_REQ;
+    lcp->identifier = ++sess->lcp_id;
+    lcp->length     = htons(payload_len);
+
+    sess->state = SESS_TERMINATING;
+    finish_and_send(m);
+    RTE_LOG(INFO, PPP, "Terminate-Request sent for session %u\n",
+            sess->session_id);
+}
+
+void
 lcp_send_term_ack(struct bras_session *sess, uint8_t id)
 {
     uint16_t payload_len = sizeof(struct lcp_hdr);
@@ -280,7 +299,6 @@ lcp_send_term_ack(struct bras_session *sess, uint8_t id)
     lcp->length     = htons(payload_len);
 
     finish_and_send(m);
-    free_session(sess->session_id);
 }
 
 static void
@@ -550,9 +568,22 @@ ppp_handle_ctrl(struct rte_mbuf *mbuf, uint16_t session_id)
             break;
         }
 
-        case LCP_TERM_REQ:
+        case LCP_TERM_REQ: {
             RTE_LOG(INFO, PPP, "[%u] LCP TERM_REQ from client\n", session_id);
+            sess_state_t state = sess->state;
             lcp_send_term_ack(sess, lcp->identifier);
+            if (state != SESS_TERMINATING)
+                free_session(session_id);
+            break;
+        }
+
+        case LCP_TERM_ACK:
+            if (sess->state == SESS_TERMINATING) {
+                RTE_LOG(INFO, PPP,
+                        "Terminate-Ack received for session %u\n",
+                        session_id);
+                free_session(session_id);
+            }
             break;
 
         case LCP_PROTO_REJ:
@@ -580,6 +611,8 @@ ppp_handle_ctrl(struct rte_mbuf *mbuf, uint16_t session_id)
             break;
 
         case LCP_ECHO_REQ: {
+            if (g_no_lcp_echo)
+                break;
             /* Reflect as ECHO_REP */
             struct rte_mbuf *m;
             uint8_t *p = begin_ppp_frame(&m, sess, PPP_LCP, lcp_len);

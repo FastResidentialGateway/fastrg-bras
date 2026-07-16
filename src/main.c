@@ -45,6 +45,7 @@
 /* ── global BRAS context ──────────────────────────────────────────────── */
 struct bras_ctx g_bras;
 auth_method_t g_default_auth_method = AUTH_PAP;
+int g_no_lcp_echo;
 
 /* ppp.c owns the injection state; main only exposes the CLI switch. */
 int ncp_injection_configure(const char *spec);
@@ -404,11 +405,20 @@ parse_vlan_spec(const char *spec)
 /* ── signal handler ───────────────────────────────────────────────────── */
 
 volatile int g_running = 1;
+volatile sig_atomic_t g_terminate_sessions;
+volatile sig_atomic_t g_padt_sessions;
 
 static void
 sig_handler(int sig)
 {
-    (void)sig;
+    if (sig == SIGUSR1) {
+        g_terminate_sessions = 1;
+        return;
+    }
+    if (sig == SIGUSR2) {
+        g_padt_sessions = 1;
+        return;
+    }
     g_running = 0;
     RTE_LOG(INFO, MAIN, "Shutting down...\n");
 }
@@ -432,6 +442,8 @@ usage(const char *prog)
         "  --inject-ncp <spec> Inject unsupported NCP Config-Requests after\n"
         "                      IPCP is up (ipv6cp, mplscp, or both comma-\n"
         "                      separated).  Default: off.\n"
+        "  --no-lcp-echo      Do not send LCP Echo-Requests or reply to them\n"
+        "                      (test-only peer-unresponsive mode).\n"
         "  --lan-alias-mac <M> Extra unicast MAC accepted on LAN RX\n"
         "                      (default 74:4D:28:8D:00:2C — the e2e bench\n"
         "                       injects frames addressed to the fastrg-node\n"
@@ -498,6 +510,7 @@ main(int argc, char *argv[])
         { "sec-dns",       required_argument, NULL, '2' },
         { "auth",          required_argument, NULL, 'a' },
         { "inject-ncp",    required_argument, NULL, 'N' },
+        { "no-lcp-echo",   no_argument,       NULL, 'E' },
         { "lan-alias-mac", required_argument, NULL, 'm' },
         { "drop-pcap",     required_argument, NULL, 'D' },
         { "vlans",         required_argument, NULL, 'V' },
@@ -529,6 +542,10 @@ main(int argc, char *argv[])
                         optarg);
                 return 1;
             }
+            continue;
+        }
+        if (opt == 'E') {
+            g_no_lcp_echo = 1;
             continue;
         }
         if (opt == 'V') {
@@ -730,6 +747,8 @@ main(int argc, char *argv[])
     /* ── Signal handler ──────────────────────────────────────────────── */
     signal(SIGINT,  sig_handler);
     signal(SIGTERM, sig_handler);
+    signal(SIGUSR1, sig_handler);
+    signal(SIGUSR2, sig_handler);
 
     /* ── Launch worker lcores ────────────────────────────────────────── */
     RTE_LOG(INFO, MAIN,
