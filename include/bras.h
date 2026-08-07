@@ -70,6 +70,7 @@
 #define PPP_PAP             0xC023
 #define PPP_CHAP            0xC223
 #define PPP_IPCP            0x8021
+#define PPP_IPV6CP          0x8057
 #define PPP_IP              0x0021
 
 /* LCP codes */
@@ -95,6 +96,9 @@
 #define IPCP_OPT_ADDR       3
 #define IPCP_OPT_PRI_DNS    129   /* Primary DNS server address  */
 #define IPCP_OPT_SEC_DNS    131   /* Secondary DNS server address */
+
+/* IPv6CP options (RFC 5072) */
+#define IPV6CP_OPT_IFID     1
 
 /* DNS servers we push to clients (defaults — Cloudflare 1.1.1.1 / Google 8.8.8.8).
  * Override at runtime via --pri-dns / --sec-dns command-line flags. */
@@ -171,6 +175,14 @@ typedef enum {
     AUTH_CHAP,
 } auth_method_t;
 
+/* IPv6CP is optional and does not affect the IPv4 session state machine. */
+typedef enum {
+    IPV6CP_IDLE = 0,
+    IPV6CP_NEGOTIATING,
+    IPV6CP_OPENED,
+    IPV6CP_FAILED,
+} ipv6cp_state_t;
+
 struct bras_session {
     sess_state_t        state;
     uint16_t            session_id;
@@ -187,6 +199,16 @@ struct bras_session {
     uint8_t             lcp_id;
     uint8_t             ipcp_id;
     uint32_t            magic_number;
+
+    /* IPv6CP negotiation state (RFC 5072) */
+    ipv6cp_state_t      ipv6cp_state;
+    uint8_t             ipv6cp_id;
+    uint8_t             ipv6cp_local_acked;
+    uint8_t             ipv6cp_peer_acked;
+    uint8_t             local_ifid[8];
+    uint8_t             peer_ifid[8];
+    uint8_t             ipv6cp_attempts;
+    uint64_t            ipv6cp_sent_at;
 
     /* Assigned addressing */
     uint32_t            client_ip;     /* IP we assign to client */
@@ -395,6 +417,7 @@ void chap_retry_pending(uint64_t now);
 int  chap_verify_response(struct bras_session *sess, uint8_t *payload, uint16_t len);
 void ipcp_send_conf_req(struct bras_session *sess);
 void ipcp_send_conf_ack(struct bras_session *sess, uint8_t id, uint32_t client_ip);
+void ipv6cp_start(struct bras_session *sess);
 
 /* nat.c — hybrid forwarding: backbone-local routed, internet-bound SNATed */
 int  route_outbound(struct rte_mbuf *mbuf, struct bras_session *sess);

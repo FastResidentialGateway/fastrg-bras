@@ -1,3 +1,5 @@
 **/*.o
 CLAUDE.md
 dpdk-bras
+.claude/
+AGENTS.md
