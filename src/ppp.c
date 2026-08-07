@@ -1,4 +1,4 @@
-/* ppp.c — LCP / IPCP / CHAP / PAP control-plane handler
+/* ppp.c — LCP / IPCP / IPv6CP / CHAP / PAP control-plane handler
  *
  * All control-protocol PDUs arrive via the ctrl_ring from the fast-path.
  * This runs entirely on LCORE_CTRL to avoid locking session state.
@@ -14,7 +14,7 @@
  *   LCP_UP  → send CHAP challenge (or PAP ack)
  *     │  auth success
  *     ▼
- *   AUTH_PENDING → IPCP negotiation
+ *   AUTH_PENDING → IPCP and IPv6CP negotiation
  *     │  IPCP CONF_ACK exchanged
  *     ▼
  *   SESS_UP  (data packets flow through fast-path)
@@ -34,37 +34,41 @@
 #define RTE_LOGTYPE_PPP RTE_LOGTYPE_USER2
 #define CHAP_RETRY_INTERVAL_SEC 3
 #define CHAP_MAX_ATTEMPTS      10
-#define PPP_IPV6CP              0x8057
 #define PPP_MPLSCP              0x8281
 #define LCP_PROTO_REJ           8
 #define NCP_RETRY_INTERVAL_SEC  3
 #define NCP_MAX_ATTEMPTS        10
-#define NCP_INJECT_IPV6CP       (1u << 0)
-#define NCP_INJECT_MPLSCP       (1u << 1)
 
 extern auth_method_t g_default_auth_method;
 
 static uint64_t chap_challenge_sent_at[MAX_SESSIONS + 1];
 static uint8_t chap_challenge_attempts[MAX_SESSIONS + 1];
 static uint64_t chap_last_retry_scan;
-static uint8_t ncp_inject_mask;
-static uint64_t ncp_sent_at[2][MAX_SESSIONS + 1];
-static uint8_t ncp_attempts[2][MAX_SESSIONS + 1];
+static uint8_t ncp_inject_mplscp;
+static uint64_t ncp_sent_at[MAX_SESSIONS + 1];
+static uint8_t ncp_attempts[MAX_SESSIONS + 1];
 static uint8_t ncp_stopped[MAX_SESSIONS + 1];
+
+static void ipv6cp_retry_pending(uint64_t now, uint64_t hz);
 
 int
 ncp_injection_configure(const char *spec)
 {
     if (strcmp(spec, "ipv6cp") == 0) {
-        ncp_inject_mask = NCP_INJECT_IPV6CP;
+        ncp_inject_mplscp = 0;
     } else if (strcmp(spec, "mplscp") == 0) {
-        ncp_inject_mask = NCP_INJECT_MPLSCP;
+        ncp_inject_mplscp = 1;
     } else if (strcmp(spec, "ipv6cp,mplscp") == 0 ||
                strcmp(spec, "mplscp,ipv6cp") == 0) {
-        ncp_inject_mask = NCP_INJECT_IPV6CP | NCP_INJECT_MPLSCP;
+        ncp_inject_mplscp = 1;
     } else {
         return -1;
     }
+
+    if (strstr(spec, "ipv6cp") != NULL)
+        RTE_LOG(WARNING, PPP,
+                "IPv6CP is supported natively; --inject-ncp ipv6cp "
+                "is ignored\n");
     return 0;
 }
 
@@ -149,10 +153,7 @@ ncp_send_conf_req(struct bras_session *sess, uint16_t proto,
 static void
 ncp_inject_pending(uint64_t now, uint64_t hz)
 {
-    static const uint16_t protos[] = { PPP_IPV6CP, PPP_MPLSCP };
-    static const char *names[] = { "IPV6CP", "MPLSCP" };
-
-    if (ncp_inject_mask == 0)
+    if (!ncp_inject_mplscp)
         return;
 
     for (uint16_t sid = 1; sid <= MAX_SESSIONS; sid++) {
@@ -160,26 +161,20 @@ ncp_inject_pending(uint64_t now, uint64_t hz)
         if (sess->state != SESS_UP)
             continue;
 
-        for (uint8_t idx = 0; idx < 2; idx++) {
-            uint8_t bit = (uint8_t)(1u << idx);
-            uint8_t attempts = ncp_attempts[idx][sid];
+        uint8_t attempts = ncp_attempts[sid];
+        if (ncp_stopped[sid] || attempts >= NCP_MAX_ATTEMPTS ||
+            (attempts > 0 && now - ncp_sent_at[sid] <
+                hz * NCP_RETRY_INTERVAL_SEC))
+            continue;
 
-            if (!(ncp_inject_mask & bit) || (ncp_stopped[sid] & bit) ||
-                attempts >= NCP_MAX_ATTEMPTS ||
-                (attempts > 0 && now - ncp_sent_at[idx][sid] <
-                    hz * NCP_RETRY_INTERVAL_SEC))
-                continue;
+        if (ncp_send_conf_req(sess, PPP_MPLSCP, attempts + 1) != 0)
+            continue;
 
-            if (ncp_send_conf_req(sess, protos[idx], attempts + 1) != 0)
-                continue;
-
-            ncp_attempts[idx][sid]++;
-            ncp_sent_at[idx][sid] = now;
-            RTE_LOG(INFO, PPP,
-                    "[%u] %s Config-Request sent for 0x%04x (%u/%u)\n",
-                    sid, names[idx], protos[idx], ncp_attempts[idx][sid],
-                    NCP_MAX_ATTEMPTS);
-        }
+        ncp_attempts[sid]++;
+        ncp_sent_at[sid] = now;
+        RTE_LOG(INFO, PPP,
+                "[%u] MPLSCP Config-Request sent for 0x%04x (%u/%u)\n",
+                sid, PPP_MPLSCP, ncp_attempts[sid], NCP_MAX_ATTEMPTS);
     }
 }
 
@@ -389,6 +384,7 @@ chap_retry_pending(uint64_t now)
                 sid, chap_challenge_attempts[sid], CHAP_MAX_ATTEMPTS);
     }
 
+    ipv6cp_retry_pending(now, hz);
     ncp_inject_pending(now, hz);
 }
 
@@ -490,10 +486,309 @@ ipcp_send_conf_ack(struct bras_session *sess, uint8_t id, uint32_t client_ip)
     finish_and_send(m);
 }
 
+/* ── IPv6CP ───────────────────────────────────────────────────────────── */
+
+static int
+ifid_is_zero(const uint8_t ifid[8])
+{
+    static const uint8_t zero_ifid[8];
+
+    return memcmp(ifid, zero_ifid, sizeof(zero_ifid)) == 0;
+}
+
+static void
+ipv6cp_log_opened(struct bras_session *sess)
+{
+    if (!sess->ipv6cp_local_acked || !sess->ipv6cp_peer_acked ||
+        sess->ipv6cp_state == IPV6CP_FAILED ||
+        sess->ipv6cp_state == IPV6CP_OPENED)
+        return;
+
+    sess->ipv6cp_state = IPV6CP_OPENED;
+    RTE_LOG(INFO, PPP,
+            "[%u] IPv6CP OPENED local_ifid="
+            "%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x peer_ifid="
+            "%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x\n",
+            sess->session_id,
+            sess->local_ifid[0], sess->local_ifid[1],
+            sess->local_ifid[2], sess->local_ifid[3],
+            sess->local_ifid[4], sess->local_ifid[5],
+            sess->local_ifid[6], sess->local_ifid[7],
+            sess->peer_ifid[0], sess->peer_ifid[1],
+            sess->peer_ifid[2], sess->peer_ifid[3],
+            sess->peer_ifid[4], sess->peer_ifid[5],
+            sess->peer_ifid[6], sess->peer_ifid[7]);
+}
+
+static int
+ipv6cp_send_conf_req(struct bras_session *sess, int new_identifier)
+{
+    if (sess->ipv6cp_attempts >= NCP_MAX_ATTEMPTS) {
+        sess->ipv6cp_state = IPV6CP_FAILED;
+        RTE_LOG(INFO, PPP,
+                "[%u] IPv6CP FAILED after %u Config-Requests; IPv4 remains "
+                "active\n",
+                sess->session_id, sess->ipv6cp_attempts);
+        return -1;
+    }
+
+    if (new_identifier)
+        ++sess->ipv6cp_id;
+
+    uint16_t opts_len = 10;
+    uint16_t payload_len = sizeof(struct lcp_hdr) + opts_len;
+    struct rte_mbuf *m;
+    uint8_t *p = begin_ppp_frame(&m, sess, PPP_IPV6CP, payload_len);
+    if (!p)
+        return -1;
+
+    struct lcp_hdr *ipv6cp = (struct lcp_hdr *)p;
+    ipv6cp->code = LCP_CONF_REQ;
+    ipv6cp->identifier = sess->ipv6cp_id;
+    ipv6cp->length = htons(payload_len);
+
+    uint8_t *opt = p + sizeof(struct lcp_hdr);
+    opt[0] = IPV6CP_OPT_IFID;
+    opt[1] = 10;
+    memcpy(&opt[2], sess->local_ifid, sizeof(sess->local_ifid));
+
+    finish_and_send(m);
+    sess->ipv6cp_attempts++;
+    sess->ipv6cp_sent_at = rte_rdtsc();
+    RTE_LOG(DEBUG, PPP,
+            "[%u] IPv6CP CONF_REQ sent id=%u (%u/%u)\n",
+            sess->session_id, sess->ipv6cp_id, sess->ipv6cp_attempts,
+            NCP_MAX_ATTEMPTS);
+    return 0;
+}
+
+void
+ipv6cp_start(struct bras_session *sess)
+{
+    const uint8_t *mac = g_bras.wan_mac.addr_bytes;
+
+    sess->local_ifid[0] = mac[0] ^ 0x02;
+    sess->local_ifid[1] = mac[1];
+    sess->local_ifid[2] = mac[2];
+    sess->local_ifid[3] = 0xff;
+    sess->local_ifid[4] = 0xfe;
+    sess->local_ifid[5] = mac[3];
+    sess->local_ifid[6] = mac[4];
+    sess->local_ifid[7] = mac[5];
+    sess->ipv6cp_state = IPV6CP_NEGOTIATING;
+    sess->ipv6cp_local_acked = 0;
+    sess->ipv6cp_attempts = 0;
+    sess->ipv6cp_sent_at = 0;
+    ipv6cp_send_conf_req(sess, 1);
+}
+
+static void
+ipv6cp_retry_pending(uint64_t now, uint64_t hz)
+{
+    for (uint16_t sid = 1; sid <= MAX_SESSIONS; sid++) {
+        struct bras_session *sess = &g_bras.sessions[sid];
+
+        if (sess->ipv6cp_state != IPV6CP_NEGOTIATING ||
+            sess->ipv6cp_local_acked ||
+            (sess->ipv6cp_attempts > 0 &&
+             now - sess->ipv6cp_sent_at <
+                hz * NCP_RETRY_INTERVAL_SEC))
+            continue;
+
+        if (sess->ipv6cp_attempts >= NCP_MAX_ATTEMPTS) {
+            sess->ipv6cp_state = IPV6CP_FAILED;
+            RTE_LOG(INFO, PPP,
+                    "[%u] IPv6CP FAILED after %u unanswered "
+                    "Config-Requests; IPv4 remains active\n",
+                    sid, sess->ipv6cp_attempts);
+            continue;
+        }
+
+        ipv6cp_send_conf_req(sess, 0);
+    }
+}
+
+static void
+ipv6cp_send_response(struct bras_session *sess, uint8_t code, uint8_t id,
+                     const uint8_t *opts, uint16_t opts_len)
+{
+    uint16_t payload_len = sizeof(struct lcp_hdr) + opts_len;
+    struct rte_mbuf *m;
+    uint8_t *p = begin_ppp_frame(&m, sess, PPP_IPV6CP, payload_len);
+    if (!p)
+        return;
+
+    struct lcp_hdr *response = (struct lcp_hdr *)p;
+    response->code = code;
+    response->identifier = id;
+    response->length = htons(payload_len);
+    if (opts_len > 0)
+        memcpy(p + sizeof(struct lcp_hdr), opts, opts_len);
+    finish_and_send(m);
+}
+
+static void
+ipv6cp_handle_conf_req(struct bras_session *sess, struct lcp_hdr *req,
+                       uint16_t len)
+{
+    uint8_t nak_buf[10];
+    uint8_t rej_buf[2048];
+    uint8_t candidate_ifid[8];
+    uint16_t nak_len = 0;
+    uint16_t rej_len = 0;
+    int have_candidate = 0;
+    uint8_t *opt = (uint8_t *)req + sizeof(struct lcp_hdr);
+    uint8_t *end = (uint8_t *)req + len;
+
+    sess->ipv6cp_peer_acked = 0;
+    if (sess->ipv6cp_state == IPV6CP_OPENED)
+        sess->ipv6cp_state = IPV6CP_NEGOTIATING;
+
+    while (opt < end) {
+        if (opt + 2 > end || opt[1] < 2 || opt + opt[1] > end) {
+            RTE_LOG(DEBUG, PPP,
+                    "[%u] malformed IPv6CP CONF_REQ ignored\n",
+                    sess->session_id);
+            return;
+        }
+
+        uint8_t olen = opt[1];
+        if (opt[0] != IPV6CP_OPT_IFID || olen != 10) {
+            if ((size_t)rej_len + olen > sizeof(rej_buf)) {
+                RTE_LOG(DEBUG, PPP,
+                        "[%u] oversized IPv6CP CONF_REQ ignored\n",
+                        sess->session_id);
+                return;
+            }
+            memcpy(&rej_buf[rej_len], opt, olen);
+            rej_len += olen;
+        } else if (ifid_is_zero(&opt[2]) ||
+                   memcmp(&opt[2], sess->local_ifid,
+                          sizeof(sess->local_ifid)) == 0) {
+            nak_buf[0] = IPV6CP_OPT_IFID;
+            nak_buf[1] = 10;
+            memset(&nak_buf[2], 0, 6);
+            nak_buf[8] = (uint8_t)(sess->session_id >> 8);
+            nak_buf[9] = (uint8_t)sess->session_id;
+            nak_len = sizeof(nak_buf);
+        } else {
+            memcpy(candidate_ifid, &opt[2], sizeof(candidate_ifid));
+            have_candidate = 1;
+        }
+        opt += olen;
+    }
+
+    if (rej_len > 0) {
+        ipv6cp_send_response(sess, LCP_CONF_REJ, req->identifier,
+                             rej_buf, rej_len);
+        RTE_LOG(DEBUG, PPP, "[%u] IPv6CP CONF_REJ sent (%u bytes)\n",
+                sess->session_id, rej_len);
+    } else if (nak_len > 0) {
+        ipv6cp_send_response(sess, LCP_CONF_NAK, req->identifier,
+                             nak_buf, nak_len);
+        RTE_LOG(DEBUG, PPP, "[%u] IPv6CP CONF_NAK sent\n",
+                sess->session_id);
+    } else {
+        uint16_t opts_len = len - sizeof(struct lcp_hdr);
+        ipv6cp_send_response(sess, LCP_CONF_ACK, req->identifier,
+                             (uint8_t *)req + sizeof(struct lcp_hdr),
+                             opts_len);
+        if (have_candidate)
+            memcpy(sess->peer_ifid, candidate_ifid,
+                   sizeof(sess->peer_ifid));
+        sess->ipv6cp_peer_acked = 1;
+        RTE_LOG(DEBUG, PPP, "[%u] IPv6CP CONF_ACK sent\n",
+                sess->session_id);
+        ipv6cp_log_opened(sess);
+    }
+}
+
+static void
+ipv6cp_handle(struct bras_session *sess, struct lcp_hdr *lcp, uint16_t len)
+{
+    switch (lcp->code) {
+    case LCP_CONF_REQ:
+        ipv6cp_handle_conf_req(sess, lcp, len);
+        break;
+
+    case LCP_CONF_ACK:
+        if (lcp->identifier != sess->ipv6cp_id) {
+            RTE_LOG(DEBUG, PPP,
+                    "[%u] stale IPv6CP CONF_ACK id=%u ignored (want %u)\n",
+                    sess->session_id, lcp->identifier, sess->ipv6cp_id);
+            break;
+        }
+        if (sess->ipv6cp_state == IPV6CP_FAILED)
+            break;
+        sess->ipv6cp_local_acked = 1;
+        RTE_LOG(DEBUG, PPP, "[%u] IPv6CP CONF_ACK received\n",
+                sess->session_id);
+        ipv6cp_log_opened(sess);
+        break;
+
+    case LCP_CONF_NAK: {
+        if (lcp->identifier != sess->ipv6cp_id ||
+            sess->ipv6cp_state == IPV6CP_FAILED)
+            break;
+
+        uint8_t *opt = (uint8_t *)lcp + sizeof(struct lcp_hdr);
+        uint8_t *end = (uint8_t *)lcp + len;
+        while (opt + 2 <= end && opt[1] >= 2 && opt + opt[1] <= end) {
+            if (opt[0] == IPV6CP_OPT_IFID && opt[1] == 10 &&
+                !ifid_is_zero(&opt[2]) &&
+                memcmp(&opt[2], sess->peer_ifid,
+                       sizeof(sess->peer_ifid)) != 0) {
+                memcpy(sess->local_ifid, &opt[2],
+                       sizeof(sess->local_ifid));
+                sess->ipv6cp_local_acked = 0;
+                sess->ipv6cp_state = IPV6CP_NEGOTIATING;
+                ipv6cp_send_conf_req(sess, 1);
+                break;
+            }
+            opt += opt[1];
+        }
+        break;
+    }
+
+    case LCP_CONF_REJ: {
+        if (lcp->identifier != sess->ipv6cp_id)
+            break;
+
+        uint8_t *opt = (uint8_t *)lcp + sizeof(struct lcp_hdr);
+        uint8_t *end = (uint8_t *)lcp + len;
+        while (opt + 2 <= end && opt[1] >= 2 && opt + opt[1] <= end) {
+            if (opt[0] == IPV6CP_OPT_IFID) {
+                sess->ipv6cp_state = IPV6CP_FAILED;
+                RTE_LOG(INFO, PPP,
+                        "[%u] IPv6CP interface-identifier rejected; IPv6 "
+                        "disabled, IPv4 remains active\n",
+                        sess->session_id);
+                break;
+            }
+            opt += opt[1];
+        }
+        break;
+    }
+
+    case LCP_TERM_REQ:
+        ipv6cp_send_response(sess, LCP_TERM_ACK, lcp->identifier, NULL, 0);
+        sess->ipv6cp_state = IPV6CP_IDLE;
+        sess->ipv6cp_local_acked = 0;
+        sess->ipv6cp_peer_acked = 0;
+        memset(sess->peer_ifid, 0, sizeof(sess->peer_ifid));
+        RTE_LOG(INFO, PPP, "[%u] IPv6CP TERM_ACK sent\n",
+                sess->session_id);
+        break;
+
+    default:
+        break;
+    }
+}
+
 /* ── ppp_handle_ctrl — dispatcher ─────────────────────────────────────── */
 
 /*
- * ppp_handle_ctrl — entry point for all PPP control packets (LCP/IPCP/auth).
+ * ppp_handle_ctrl — entry point for all PPP control packets.
  * Called from ctrl_plane_lcore() for every PPPoE session frame whose PPP
  * protocol is NOT 0x0021 (IP data).
  */
@@ -516,12 +811,21 @@ ppp_handle_ctrl(struct rte_mbuf *mbuf, uint16_t session_id)
     bras_frame_ethertype(base, &l2_len, &vlan_tci);
     (void)vlan_tci;
     size_t off = l2_len + sizeof(struct pppoe_hdr) + sizeof(struct ppp_hdr);
+    if (rte_pktmbuf_pkt_len(mbuf) < off + sizeof(struct lcp_hdr)) {
+        rte_pktmbuf_free(mbuf);
+        return;
+    }
     struct ppp_hdr *pph = (struct ppp_hdr *)
         (base + l2_len + sizeof(struct pppoe_hdr));
     uint16_t proto = ntohs(pph->protocol);
 
     struct lcp_hdr *lcp = (struct lcp_hdr *)(base + off);
     uint16_t lcp_len = ntohs(lcp->length);
+    if (lcp_len < sizeof(struct lcp_hdr) ||
+        rte_pktmbuf_pkt_len(mbuf) < off + lcp_len) {
+        rte_pktmbuf_free(mbuf);
+        return;
+    }
 
     switch (proto) {
     /* ── LCP ──────────────────────────────────────────────────────── */
@@ -595,13 +899,13 @@ ppp_handle_ctrl(struct rte_mbuf *mbuf, uint16_t session_id)
                 rejected_proto = ntohs(rejected_proto);
 
                 if (rejected_proto == PPP_IPV6CP) {
-                    ncp_stopped[session_id] |= NCP_INJECT_IPV6CP;
+                    sess->ipv6cp_state = IPV6CP_FAILED;
                     RTE_LOG(INFO, PPP,
                             "[%u] Protocol-Reject received for 0x8057 — "
-                            "stopping IPV6CP\n",
+                            "stopping IPv6CP; IPv4 remains active\n",
                             session_id);
                 } else if (rejected_proto == PPP_MPLSCP) {
-                    ncp_stopped[session_id] |= NCP_INJECT_MPLSCP;
+                    ncp_stopped[session_id] = 1;
                     RTE_LOG(INFO, PPP,
                             "[%u] Protocol-Reject received for 0x8281 — "
                             "stopping MPLSCP\n",
@@ -638,8 +942,12 @@ ppp_handle_ctrl(struct rte_mbuf *mbuf, uint16_t session_id)
                          lcp_len - sizeof(struct lcp_hdr));
             chap_send_result(sess, ok);
             if (ok) {
-                RTE_LOG(INFO, PPP, "[%u] auth OK — starting IPCP\n", session_id);
+                RTE_LOG(INFO, PPP,
+                        "[%u] auth OK — starting IPCP and IPv6CP\n",
+                        session_id);
                 ipcp_send_conf_req(sess);
+                if (sess->state != SESS_FREE)
+                    ipv6cp_start(sess);
             } else {
                 RTE_LOG(INFO, PPP, "[%u] auth FAILED — tearing down\n", session_id);
                 pppoe_send_padt(sess);
@@ -664,7 +972,14 @@ ppp_handle_ctrl(struct rte_mbuf *mbuf, uint16_t session_id)
             }
             sess->state = SESS_AUTH_PENDING;
             ipcp_send_conf_req(sess);
+            if (sess->state != SESS_FREE)
+                ipv6cp_start(sess);
         }
+        break;
+
+    /* ── IPv6CP ────────────────────────────────────────────────────── */
+    case PPP_IPV6CP:
+        ipv6cp_handle(sess, lcp, lcp_len);
         break;
 
     /* ── IPCP ─────────────────────────────────────────────────────── */
@@ -793,10 +1108,8 @@ ppp_handle_ctrl(struct rte_mbuf *mbuf, uint16_t session_id)
                     (sess->client_ip >>  8) & 0xFF,
                     (sess->client_ip      ) & 0xFF);
             if (sess->state != SESS_UP) {
-                for (uint8_t idx = 0; idx < 2; idx++) {
-                    ncp_attempts[idx][session_id] = 0;
-                    ncp_sent_at[idx][session_id] = 0;
-                }
+                ncp_attempts[session_id] = 0;
+                ncp_sent_at[session_id] = 0;
                 ncp_stopped[session_id] = 0;
             }
             sess->state = SESS_UP;

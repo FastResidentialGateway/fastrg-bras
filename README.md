@@ -6,6 +6,7 @@ A minimal DPDK-based BRAS implementing:
 - **CHAP** authentication (MD5 challenge/response — accept-all for lab)
 - **IPCP** address assignment from a /30 pool per session
 - **IPCP DNS push** — primary/secondary DNS via options 129/131 (RFC 1877)
+- **IPv6CP** interface-identifier negotiation (RFC 5072)
 - **SNAT/DNAT** forwarding: PPPoE sessions ↔ upstream server
 
 ---
@@ -74,7 +75,7 @@ TX queue count.
 |-------|------|
 | 0 | main — init, stats loop, signal handling |
 | 1 | `rx_dist_lcore` — polls WAN+LAN queue 0, classifies, tags by 5-tuple, fans out via `rte_distributor` |
-| 2 | `ctrl_plane_lcore` — drains `ctrl_ring`, runs PPPoE/PPP/IPCP state machines |
+| 2 | `ctrl_plane_lcore` — drains `ctrl_ring`, runs PPPoE/PPP/IPCP/IPv6CP state machines |
 | 3+ | `dist_worker_lcore` × N — NAT + forwarding, each with a dedicated TX queue |
 
 **Legacy mode** (fallback: < 4 lcores or single-queue vdevs like af_packet):
@@ -130,7 +131,8 @@ Inbound (upstream → PPPoE):
 - Per-worker TX queues are already implemented (distributor mode allocates
   one TX queue per worker plus queue 0 for the RX lcore and queue N+1 for
   the ctrl lcore); legacy mode still uses a single shared TX queue.
-- No IPv6CP.
+- IPv6CP negotiates link-local interface identifiers only; IPv6 data forwarding
+  and DHCPv6 are not implemented yet.
 - NAT entries are reclaimed by `nat_expire()` after 300 s of idle time;
   the ctrl lcore calls it on a 10 s tick.
 
