@@ -74,6 +74,16 @@
 #define PPP_IP              0x0021
 #define PPP_IPV6            0x0057
 
+/* ICMPv6 message and neighbour-discovery option types. */
+#define ICMPV6_ECHO_REQ      128
+#define ICMPV6_ECHO_REP      129
+#define ICMPV6_RS            133
+#define ICMPV6_RA            134
+#define ICMPV6_NS            135
+#define ICMPV6_NA            136
+#define ND6_OPT_SLL          1
+#define ND6_OPT_TLL          2
+
 /* LCP codes */
 #define LCP_CONF_REQ        1
 #define LCP_CONF_ACK        2
@@ -328,6 +338,14 @@ struct bras_ctx {
     struct rte_ether_addr upstream_mac;      /* learned via ARP */
     volatile uint8_t      upstream_mac_valid;
 
+    /* IPv6 upstream-side addressing and resolved next-hop. */
+    uint8_t             lan_ip6[16];       /* our LAN-side global address */
+    uint8_t             lan_ip6_ll[16];    /* fe80:: EUI-64(lan_mac)      */
+    uint8_t             upstream_ip6[16];  /* next-hop for v6 outbound    */
+    struct rte_ether_addr upstream_mac6;    /* learned via NDP             */
+    volatile uint8_t      upstream_mac6_valid;
+    uint8_t             wan_ll[16];        /* fe80:: EUI-64(wan_mac)      */
+
     /* Extra unicast MAC accepted on LAN RX (e2e bench injects frames
      * addressed to the fastrg-node WAN MAC; VF promiscuous is unavailable
      * without PF trust, so we add it as a second MAC filter). */
@@ -352,6 +370,8 @@ struct bras_ctx {
     /* Multi-queue: per-port queue count and lcore→TX-queue mapping */
     uint16_t            n_queues;
     uint16_t            lcore_queue[RTE_MAX_LCORE];
+    uint8_t             tx_queue_shared; /* serialize TX only when legacy
+                                          * lcores share a hardware queue */
 
     /* Software distributor datapath (X520/82599 VF cannot RSS PPPoE: the
      * inner IP is hidden behind the PPPoE header, so hardware always lands
@@ -482,6 +502,17 @@ int  ctrl_plane_lcore(void *arg);
 void arp_input(struct rte_mbuf *mbuf);          /* consumes mbuf */
 void arp_request_upstream(void);
 int  lan_icmp_echo_input(struct rte_mbuf *mbuf); /* 0 = consumed */
+
+/* ipv6.c — callers/lcores are documented at each implementation. */
+void ipv6_mac_to_ifid(const struct rte_ether_addr *mac, uint8_t ifid[8]);
+void ipv6_addr_init(void);                         /* main lcore, after ports */
+int  ipv6_lan_input(struct rte_mbuf *mbuf);        /* RX lcore; 0 = consumed */
+int  ipv6_route_outbound(struct rte_mbuf *mbuf,
+                         struct bras_session *sess); /* data worker */
+int  ipv6_route_inbound(struct rte_mbuf *mbuf);    /* data worker */
+void ipv6_ctrl_input(struct bras_session *sess,
+                     const uint8_t *ip6, uint16_t len); /* ctrl lcore */
+void nd6_request_upstream(void);                   /* ctrl lcore */
 
 /* utils.c */
 struct rte_mbuf *alloc_pkt(uint16_t data_room);
