@@ -78,8 +78,8 @@ ncp_injection_configure(const char *spec)
  * Build: Ethernet / PPPoE-session / PPP-protocol / <payload>
  * Caller fills payload after calling this; returns pointer to payload area.
  */
-static uint8_t *
-begin_ppp_frame(struct rte_mbuf **out_mbuf,
+uint8_t *
+ppp_begin_frame(struct rte_mbuf **out_mbuf,
                 struct bras_session *sess,
                 uint16_t ppp_proto,
                 uint16_t payload_room)
@@ -138,7 +138,7 @@ ncp_send_conf_req(struct bras_session *sess, uint16_t proto,
                   uint8_t identifier)
 {
     struct rte_mbuf *m;
-    uint8_t *p = begin_ppp_frame(&m, sess, proto, sizeof(struct lcp_hdr));
+    uint8_t *p = ppp_begin_frame(&m, sess, proto, sizeof(struct lcp_hdr));
     if (!p)
         return -1;
 
@@ -197,7 +197,7 @@ lcp_send_conf_req(struct bras_session *sess)
     uint16_t payload_len  = sizeof(struct lcp_hdr) + opts_len;
 
     struct rte_mbuf *m;
-    uint8_t *p = begin_ppp_frame(&m, sess, PPP_LCP, payload_len);
+    uint8_t *p = ppp_begin_frame(&m, sess, PPP_LCP, payload_len);
     if (!p) return;
 
     struct lcp_hdr *lcp = (struct lcp_hdr *)p;
@@ -246,7 +246,7 @@ lcp_send_conf_ack(struct bras_session *sess, struct lcp_hdr *req, uint16_t len)
     uint16_t opts_len = len - sizeof(struct lcp_hdr);
     uint16_t payload_len = len;
     struct rte_mbuf *m;
-    uint8_t *p = begin_ppp_frame(&m, sess, PPP_LCP, payload_len);
+    uint8_t *p = ppp_begin_frame(&m, sess, PPP_LCP, payload_len);
     if (!p) return;
 
     struct lcp_hdr *ack = (struct lcp_hdr *)p;
@@ -266,7 +266,7 @@ lcp_send_term_req(struct bras_session *sess)
 {
     uint16_t payload_len = sizeof(struct lcp_hdr);
     struct rte_mbuf *m;
-    uint8_t *p = begin_ppp_frame(&m, sess, PPP_LCP, payload_len);
+    uint8_t *p = ppp_begin_frame(&m, sess, PPP_LCP, payload_len);
     if (!p) return;
 
     struct lcp_hdr *lcp = (struct lcp_hdr *)p;
@@ -285,7 +285,7 @@ lcp_send_term_ack(struct bras_session *sess, uint8_t id)
 {
     uint16_t payload_len = sizeof(struct lcp_hdr);
     struct rte_mbuf *m;
-    uint8_t *p = begin_ppp_frame(&m, sess, PPP_LCP, payload_len);
+    uint8_t *p = ppp_begin_frame(&m, sess, PPP_LCP, payload_len);
     if (!p) return;
 
     struct lcp_hdr *lcp = (struct lcp_hdr *)p;
@@ -301,7 +301,7 @@ ipcp_send_term_ack(struct bras_session *sess, uint8_t id)
 {
     uint16_t payload_len = sizeof(struct lcp_hdr);
     struct rte_mbuf *m;
-    uint8_t *p = begin_ppp_frame(&m, sess, PPP_IPCP, payload_len);
+    uint8_t *p = ppp_begin_frame(&m, sess, PPP_IPCP, payload_len);
     if (!p) return;
 
     struct lcp_hdr *lcp = (struct lcp_hdr *)p;
@@ -327,7 +327,7 @@ chap_send_challenge_packet(struct bras_session *sess)
     uint16_t payload_len = 1 + 1 + 2 + 1 + challen_len + name_len;
 
     struct rte_mbuf *m;
-    uint8_t *p = begin_ppp_frame(&m, sess, PPP_CHAP, payload_len);
+    uint8_t *p = ppp_begin_frame(&m, sess, PPP_CHAP, payload_len);
     if (!p) return;
 
     p[0] = CHAP_CHALLENGE;
@@ -412,7 +412,7 @@ chap_send_result(struct bras_session *sess, int success)
     uint16_t payload_len = 1 + 1 + 2 + msg_l;
 
     struct rte_mbuf *m;
-    uint8_t *p = begin_ppp_frame(&m, sess, PPP_CHAP, payload_len);
+    uint8_t *p = ppp_begin_frame(&m, sess, PPP_CHAP, payload_len);
     if (!p) return;
 
     p[0] = success ? CHAP_SUCCESS : CHAP_FAILURE;
@@ -443,7 +443,7 @@ ipcp_send_conf_req(struct bras_session *sess)
     uint16_t payload_len = sizeof(struct lcp_hdr) + opts_len;
 
     struct rte_mbuf *m;
-    uint8_t *p = begin_ppp_frame(&m, sess, PPP_IPCP, payload_len);
+    uint8_t *p = ppp_begin_frame(&m, sess, PPP_IPCP, payload_len);
     if (!p) return;
 
     struct lcp_hdr *ipcp = (struct lcp_hdr *)p;
@@ -469,7 +469,7 @@ ipcp_send_conf_ack(struct bras_session *sess, uint8_t id, uint32_t client_ip)
     uint16_t payload_len = sizeof(struct lcp_hdr) + opts_len;
 
     struct rte_mbuf *m;
-    uint8_t *p = begin_ppp_frame(&m, sess, PPP_IPCP, payload_len);
+    uint8_t *p = ppp_begin_frame(&m, sess, PPP_IPCP, payload_len);
     if (!p) return;
 
     struct lcp_hdr *ipcp = (struct lcp_hdr *)p;
@@ -538,7 +538,7 @@ ipv6cp_send_conf_req(struct bras_session *sess, int new_identifier)
     uint16_t opts_len = 10;
     uint16_t payload_len = sizeof(struct lcp_hdr) + opts_len;
     struct rte_mbuf *m;
-    uint8_t *p = begin_ppp_frame(&m, sess, PPP_IPV6CP, payload_len);
+    uint8_t *p = ppp_begin_frame(&m, sess, PPP_IPV6CP, payload_len);
     if (!p)
         return -1;
 
@@ -614,7 +614,7 @@ ipv6cp_send_response(struct bras_session *sess, uint8_t code, uint8_t id,
 {
     uint16_t payload_len = sizeof(struct lcp_hdr) + opts_len;
     struct rte_mbuf *m;
-    uint8_t *p = begin_ppp_frame(&m, sess, PPP_IPV6CP, payload_len);
+    uint8_t *p = ppp_begin_frame(&m, sess, PPP_IPV6CP, payload_len);
     if (!p)
         return;
 
@@ -788,7 +788,8 @@ ipv6cp_handle(struct bras_session *sess, struct lcp_hdr *lcp, uint16_t len)
 /* ── ppp_handle_ctrl — dispatcher ─────────────────────────────────────── */
 
 /*
- * ppp_handle_ctrl — entry point for all PPP control packets.
+ * ppp_handle_ctrl — entry point for PPP control packets and IPv6 packets
+ * handled by control-plane services such as DHCPv6.
  * Called from ctrl_plane_lcore() for every PPPoE session frame whose PPP
  * protocol is NOT 0x0021 (IP data).
  */
@@ -818,6 +819,13 @@ ppp_handle_ctrl(struct rte_mbuf *mbuf, uint16_t session_id)
     struct ppp_hdr *pph = (struct ppp_hdr *)
         (base + l2_len + sizeof(struct pppoe_hdr));
     uint16_t proto = ntohs(pph->protocol);
+
+    if (proto == PPP_IPV6) {
+        dhcpv6_input(sess, base + off,
+                     (uint16_t)(rte_pktmbuf_pkt_len(mbuf) - off));
+        rte_pktmbuf_free(mbuf);
+        return;
+    }
 
     struct lcp_hdr *lcp = (struct lcp_hdr *)(base + off);
     uint16_t lcp_len = ntohs(lcp->length);
@@ -919,7 +927,7 @@ ppp_handle_ctrl(struct rte_mbuf *mbuf, uint16_t session_id)
                 break;
             /* Reflect as ECHO_REP */
             struct rte_mbuf *m;
-            uint8_t *p = begin_ppp_frame(&m, sess, PPP_LCP, lcp_len);
+            uint8_t *p = ppp_begin_frame(&m, sess, PPP_LCP, lcp_len);
             if (p) {
                 memcpy(p, lcp, lcp_len);
                 ((struct lcp_hdr *)p)->code = LCP_ECHO_REP;
@@ -963,7 +971,7 @@ ppp_handle_ctrl(struct rte_mbuf *mbuf, uint16_t session_id)
             const char *msg = "OK";
             uint16_t pl = 1+1+2+1+(uint16_t)strlen(msg);
             struct rte_mbuf *m;
-            uint8_t *p = begin_ppp_frame(&m, sess, PPP_PAP, pl);
+            uint8_t *p = ppp_begin_frame(&m, sess, PPP_PAP, pl);
             if (p) {
                 p[0] = PAP_AUTH_ACK; p[1] = lcp->identifier;
                 uint16_t l = htons(pl); memcpy(&p[2],&l,2);
@@ -1052,7 +1060,7 @@ ppp_handle_ctrl(struct rte_mbuf *mbuf, uint16_t session_id)
             if (rej_len > 0) {
                 uint16_t pl = sizeof(struct lcp_hdr) + rej_len;
                 struct rte_mbuf *m;
-                uint8_t *p = begin_ppp_frame(&m, sess, PPP_IPCP, pl);
+                uint8_t *p = ppp_begin_frame(&m, sess, PPP_IPCP, pl);
                 if (p) {
                     struct lcp_hdr *rej = (struct lcp_hdr *)p;
                     rej->code = IPCP_CONF_REJ;
@@ -1066,7 +1074,7 @@ ppp_handle_ctrl(struct rte_mbuf *mbuf, uint16_t session_id)
             } else if (nak_len > 0) {
                 uint16_t pl = sizeof(struct lcp_hdr) + nak_len;
                 struct rte_mbuf *m;
-                uint8_t *p = begin_ppp_frame(&m, sess, PPP_IPCP, pl);
+                uint8_t *p = ppp_begin_frame(&m, sess, PPP_IPCP, pl);
                 if (p) {
                     struct lcp_hdr *nak = (struct lcp_hdr *)p;
                     nak->code = IPCP_CONF_NAK;
@@ -1082,7 +1090,7 @@ ppp_handle_ctrl(struct rte_mbuf *mbuf, uint16_t session_id)
                 uint16_t opts_total = lcp_len - sizeof(struct lcp_hdr);
                 uint16_t pl = sizeof(struct lcp_hdr) + opts_total;
                 struct rte_mbuf *m;
-                uint8_t *p = begin_ppp_frame(&m, sess, PPP_IPCP, pl);
+                uint8_t *p = ppp_begin_frame(&m, sess, PPP_IPCP, pl);
                 if (p) {
                     struct lcp_hdr *ack = (struct lcp_hdr *)p;
                     ack->code = IPCP_CONF_ACK;

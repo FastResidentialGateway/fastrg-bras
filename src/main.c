@@ -50,6 +50,12 @@ int g_no_lcp_echo;
 /* ppp.c owns the injection state; main only exposes the CLI switch. */
 int ncp_injection_configure(const char *spec);
 
+enum {
+    OPT_PD_POOL = 256,
+    OPT_PRI_DNS6,
+    OPT_SEC_DNS6,
+};
+
 /* ── port configuration ───────────────────────────────────────────────── */
 
 static int
@@ -426,6 +432,63 @@ sig_handler(int sig)
 /* ── main ─────────────────────────────────────────────────────────────── */
 
 static void
+format_ipv6(const uint8_t address[16], char output[INET6_ADDRSTRLEN])
+{
+    if (!inet_ntop(AF_INET6, address, output, INET6_ADDRSTRLEN))
+        strcpy(output, "<invalid>");
+}
+
+static int
+parse_pd_pool(const char *spec)
+{
+    const char *slash = strrchr(spec, '/');
+    if (!slash || slash == spec || strchr(spec, '/') != slash)
+        return -1;
+
+    size_t address_len = (size_t)(slash - spec);
+    if (address_len >= INET6_ADDRSTRLEN)
+        return -1;
+
+    char address_text[INET6_ADDRSTRLEN];
+    memcpy(address_text, spec, address_len);
+    address_text[address_len] = '\0';
+
+    for (const char *p = slash + 1; *p != '\0'; p++) {
+        if (*p < '0' || *p > '9')
+            return -1;
+    }
+    char *end;
+    long plen = strtol(slash + 1, &end, 10);
+    if (slash[1] == '\0' || *end != '\0' || plen < 1 || plen > 55)
+        return -1;
+
+    uint8_t address[16];
+    if (inet_pton(AF_INET6, address_text, address) != 1)
+        return -1;
+
+    unsigned int full_bytes = (unsigned int)plen / 8;
+    unsigned int prefix_bits = (unsigned int)plen % 8;
+    if (prefix_bits != 0) {
+        uint8_t host_mask = (uint8_t)(0xffu >> prefix_bits);
+        if ((address[full_bytes] & host_mask) != 0)
+            return -1;
+    }
+    unsigned int host_start = full_bytes + (prefix_bits != 0);
+    for (unsigned int i = host_start; i < sizeof(address); i++) {
+        if (address[i] != 0)
+            return -1;
+    }
+
+    if (prefix_bits != 0)
+        address[full_bytes] &= (uint8_t)(0xffu << (8 - prefix_bits));
+    memset(address + host_start, 0, sizeof(address) - host_start);
+    memcpy(g_bras.pd_pool_prefix, address,
+           sizeof(g_bras.pd_pool_prefix));
+    g_bras.pd_pool_plen = (uint8_t)plen;
+    return 0;
+}
+
+static void
 usage(const char *prog)
 {
     fprintf(stderr,
@@ -438,6 +501,10 @@ usage(const char *prog)
         "  --upstream-ip <IP>  LAN next-hop          (default 192.168.201.11)\n"
         "  --pri-dns <IP>      Primary DNS via IPCP  (default 1.1.1.1)\n"
         "  --sec-dns <IP>      Secondary DNS via IPCP(default 8.8.8.8)\n"
+        "  --pd-pool <P/L>     DHCPv6-PD /56 pool; pool plen 1..55\n"
+        "                      (default 2001:db8:6400::/48)\n"
+        "  --pri-dns6 <IPv6>   Primary DHCPv6 DNS   (default 2606:4700:4700::1111)\n"
+        "  --sec-dns6 <IPv6>   Secondary DHCPv6 DNS (default 2001:4860:4860::8888)\n"
         "  --auth <pap|chap>   PPP authentication    (default pap)\n"
         "  --inject-ncp <spec> Inject MPLSCP Config-Requests after IPCP is\n"
         "                      up. ipv6cp is accepted for compatibility but\n"
@@ -492,6 +559,12 @@ main(int argc, char *argv[])
     g_bras.upstream_ip   = DEFAULT_UPSTREAM_IP;
     g_bras.pri_dns       = DEFAULT_PRI_DNS;
     g_bras.sec_dns       = DEFAULT_SEC_DNS;
+    if (parse_pd_pool("2001:db8:6400::/48") != 0 ||
+        inet_pton(AF_INET6, "2606:4700:4700::1111", g_bras.dns6_pri) != 1 ||
+        inet_pton(AF_INET6, "2001:4860:4860::8888", g_bras.dns6_sec) != 1) {
+        fprintf(stderr, "Invalid built-in DHCPv6 defaults\n");
+        return 1;
+    }
     /* e2e bench injects WAN-side frames addressed to the fastrg-node WAN
      * MAC; the LAN VF must explicitly filter-in that address (the 82599 VF
      * does not honour promiscuous mode without PF trust). */
@@ -508,6 +581,9 @@ main(int argc, char *argv[])
         { "upstream-ip",   required_argument, NULL, 'u' },
         { "pri-dns",       required_argument, NULL, '1' },
         { "sec-dns",       required_argument, NULL, '2' },
+        { "pd-pool",       required_argument, NULL, OPT_PD_POOL },
+        { "pri-dns6",      required_argument, NULL, OPT_PRI_DNS6 },
+        { "sec-dns6",      required_argument, NULL, OPT_SEC_DNS6 },
         { "auth",          required_argument, NULL, 'a' },
         { "inject-ncp",    required_argument, NULL, 'N' },
         { "no-lcp-echo",   no_argument,       NULL, 'E' },
@@ -540,6 +616,25 @@ main(int argc, char *argv[])
                         "Bad --inject-ncp spec: %s (expected ipv6cp, mplscp, "
                         "or ipv6cp,mplscp)\n",
                         optarg);
+                return 1;
+            }
+            continue;
+        }
+        if (opt == OPT_PD_POOL) {
+            if (parse_pd_pool(optarg) != 0) {
+                fprintf(stderr,
+                        "Bad --pd-pool: %s (expected network prefix with "
+                        "length 1..55 and zero host bits)\n",
+                        optarg);
+                return 1;
+            }
+            continue;
+        }
+        if (opt == OPT_PRI_DNS6 || opt == OPT_SEC_DNS6) {
+            uint8_t *dns = opt == OPT_PRI_DNS6 ?
+                g_bras.dns6_pri : g_bras.dns6_sec;
+            if (inet_pton(AF_INET6, optarg, dns) != 1) {
+                fprintf(stderr, "Bad IPv6 DNS argument: %s\n", optarg);
                 return 1;
             }
             continue;
@@ -782,6 +877,20 @@ main(int argc, char *argv[])
             (g_bras.pri_dns >>  8) & 0xFF, (g_bras.pri_dns      ) & 0xFF,
             (g_bras.sec_dns >> 24) & 0xFF, (g_bras.sec_dns >> 16) & 0xFF,
             (g_bras.sec_dns >>  8) & 0xFF, (g_bras.sec_dns      ) & 0xFF);
+
+    uint8_t pd_pool_address[16] = {0};
+    memcpy(pd_pool_address, g_bras.pd_pool_prefix,
+           sizeof(g_bras.pd_pool_prefix));
+    char pd_pool_text[INET6_ADDRSTRLEN];
+    char dns6_pri_text[INET6_ADDRSTRLEN];
+    char dns6_sec_text[INET6_ADDRSTRLEN];
+    format_ipv6(pd_pool_address, pd_pool_text);
+    format_ipv6(g_bras.dns6_pri, dns6_pri_text);
+    format_ipv6(g_bras.dns6_sec, dns6_sec_text);
+    RTE_LOG(INFO, MAIN,
+            "DHCPv6-PD: pool=%s/%u primary_dns=%s secondary_dns=%s\n",
+            pd_pool_text, g_bras.pd_pool_plen,
+            dns6_pri_text, dns6_sec_text);
 
     if (g_bras.dist) {
         rte_eal_remote_launch(rx_dist_lcore, NULL, data_lcores[0]);
