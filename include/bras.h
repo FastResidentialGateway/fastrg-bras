@@ -41,7 +41,7 @@
 #define MAX_RX_QUEUES       8           /* max data-path lcores / queues per port */
 
 /* LCore assignment */
-#define LCORE_CTRL          2           /* control plane: PPPoE/LCP/IPCP */
+#define LCORE_CTRL          2           /* control plane: PPPoE/PPP/DHCPv6 */
 #define MAX_DIST_WORKERS    8           /* max distributor worker lcores */
 
 /* =====================================================================
@@ -72,6 +72,7 @@
 #define PPP_IPCP            0x8021
 #define PPP_IPV6CP          0x8057
 #define PPP_IP              0x0021
+#define PPP_IPV6            0x0057
 
 /* LCP codes */
 #define LCP_CONF_REQ        1
@@ -104,6 +105,33 @@
  * Override at runtime via --pri-dns / --sec-dns command-line flags. */
 #define DEFAULT_PRI_DNS     RTE_IPV4(1, 1, 1, 1)
 #define DEFAULT_SEC_DNS     RTE_IPV4(8, 8, 8, 8)
+
+/* DHCPv6 message types, options, ports, and lease timers (RFC 8415). */
+#define DHCPV6_SOLICIT              1
+#define DHCPV6_ADVERTISE            2
+#define DHCPV6_REQUEST              3
+#define DHCPV6_RENEW                5
+#define DHCPV6_REBIND               6
+#define DHCPV6_REPLY                7
+#define DHCPV6_RELEASE              8
+
+#define DHCPV6_OPT_CLIENTID         1
+#define DHCPV6_OPT_SERVERID         2
+#define DHCPV6_OPT_ORO              6
+#define DHCPV6_OPT_STATUS           13
+#define DHCPV6_OPT_DNS_SERVERS      23
+#define DHCPV6_OPT_IA_PD            25
+#define DHCPV6_OPT_IAPREFIX         26
+
+#define DHCPV6_CLIENT_PORT          546
+#define DHCPV6_SERVER_PORT          547
+#define DHCPV6_STATUS_SUCCESS       0
+#define DHCPV6_STATUS_NO_PREFIX     6
+#define DHCPV6_PREFERRED_LIFETIME   43200
+#define DHCPV6_VALID_LIFETIME       86400
+#define DHCPV6_T1                   21600
+#define DHCPV6_T2                   34560
+#define DHCPV6_PD_PLEN              56
 
 /* CHAP codes */
 #define CHAP_CHALLENGE      1
@@ -210,6 +238,12 @@ struct bras_session {
     uint8_t             ipv6cp_attempts;
     uint64_t            ipv6cp_sent_at;
 
+    /* DHCPv6-PD lease: high 64 bits of the delegated /56.  Bits 56..63
+     * remain zero so the client can subnet the prefix into /64 LANs. */
+    uint8_t             pd_prefix[8];
+    uint8_t             pd_active;
+    uint32_t            pd_iaid;
+
     /* Assigned addressing */
     uint32_t            client_ip;     /* IP we assign to client */
     uint32_t            server_ip;     /* our PPP endpoint IP   */
@@ -236,7 +270,7 @@ struct bras_session {
  * ===================================================================== */
 typedef enum {
     CTRL_MSG_PPPOE_DISC,    /* discovery packet (PADI/PADR/PADT) */
-    CTRL_MSG_PPP_CTRL,      /* LCP / IPCP / auth packet */
+    CTRL_MSG_PPP_CTRL,      /* PPP control or control-plane IPv6 packet */
 } ctrl_msg_type_t;
 
 struct ctrl_msg {
@@ -308,6 +342,12 @@ struct bras_ctx {
     /* DNS servers pushed to clients via IPCP options 129/131 (RFC 1877) */
     uint32_t            pri_dns;
     uint32_t            sec_dns;
+
+    /* DHCPv6 delegated-prefix pool and DNS servers. */
+    uint8_t             pd_pool_prefix[8];
+    uint8_t             pd_pool_plen;
+    uint8_t             dns6_pri[16];
+    uint8_t             dns6_sec[16];
 
     /* Multi-queue: per-port queue count and lcore→TX-queue mapping */
     uint16_t            n_queues;
@@ -418,6 +458,12 @@ int  chap_verify_response(struct bras_session *sess, uint8_t *payload, uint16_t 
 void ipcp_send_conf_req(struct bras_session *sess);
 void ipcp_send_conf_ack(struct bras_session *sess, uint8_t id, uint32_t client_ip);
 void ipv6cp_start(struct bras_session *sess);
+uint8_t *ppp_begin_frame(struct rte_mbuf **out_mbuf,
+                         struct bras_session *sess, uint16_t ppp_proto,
+                         uint16_t payload_room);
+
+/* dhcpv6.c */
+void dhcpv6_input(struct bras_session *sess, const uint8_t *ip6, uint16_t len);
 
 /* nat.c — hybrid forwarding: backbone-local routed, internet-bound SNATed */
 int  route_outbound(struct rte_mbuf *mbuf, struct bras_session *sess);

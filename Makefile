@@ -4,6 +4,7 @@ TARGET  := dpdk-bras
 SRCS := src/main.c \
         src/pppoe.c \
         src/ppp.c \
+        src/dhcpv6.c \
         src/nat.c \
         src/arp.c \
         src/datapath.c

@@ -7,6 +7,7 @@ A minimal DPDK-based BRAS implementing:
 - **IPCP** address assignment from a /30 pool per session
 - **IPCP DNS push** — primary/secondary DNS via options 129/131 (RFC 1877)
 - **IPv6CP** interface-identifier negotiation (RFC 5072)
+- **DHCPv6-PD** deterministic /56 delegation with recursive DNS (RFC 8415)
 - **SNAT/DNAT** forwarding: PPPoE sessions ↔ upstream server
 
 ---
@@ -43,7 +44,8 @@ NIC connected to dpdk-bras's WAN port. The BRAS will:
    - Session 1 → server `10.64.0.1`, client `10.64.0.2`
    - Session 2 → server `10.64.0.5`, client `10.64.0.6`
    - Session N → server `10.64.0.(N-1)*4+1`, client `+1`
-5. Route client data to upstream server via SNAT
+5. Delegate a deterministic IPv6 /56 after IPv6CP opens
+6. Route client IPv4 data to upstream server via SNAT
 
 ---
 
@@ -57,7 +59,8 @@ apt install dpdk dpdk-dev libnuma-dev meson ninja-build python3-pyelftools
 make
 
 # Example Run
-./dpdk-bras -l 0-5 -n 4 -- --pri-dns 192.168.10.1 --drop-pcap ./test.pcap --vlans 3,5
+./dpdk-bras -l 0-5 -n 4 -- --pri-dns 192.168.10.1 \
+  --pd-pool 2001:db8:6400::/48 --drop-pcap ./test.pcap --vlans 3,5
 ```
 
 ---
@@ -75,7 +78,7 @@ TX queue count.
 |-------|------|
 | 0 | main — init, stats loop, signal handling |
 | 1 | `rx_dist_lcore` — polls WAN+LAN queue 0, classifies, tags by 5-tuple, fans out via `rte_distributor` |
-| 2 | `ctrl_plane_lcore` — drains `ctrl_ring`, runs PPPoE/PPP/IPCP/IPv6CP state machines |
+| 2 | `ctrl_plane_lcore` — drains `ctrl_ring`, runs PPPoE/PPP/IPCP/IPv6CP/DHCPv6 state machines |
 | 3+ | `dist_worker_lcore` × N — NAT + forwarding, each with a dedicated TX queue |
 
 **Legacy mode** (fallback: < 4 lcores or single-queue vdevs like af_packet):
@@ -118,7 +121,8 @@ Inbound (upstream → PPPoE):
 | `include/bras.h` | All structs, constants, function prototypes |
 | `src/main.c` | EAL init, port setup, lcore launch, utility functions |
 | `src/pppoe.c` | PPPoE Discovery state machine |
-| `src/ppp.c` | LCP/IPCP/CHAP/PAP control plane |
+| `src/ppp.c` | LCP/IPCP/IPv6CP/CHAP/PAP control plane |
+| `src/dhcpv6.c` | DHCPv6 prefix delegation and DNS replies |
 | `src/nat.c` | SNAT/DNAT engine with rte_hash tables |
 | `src/datapath.c` | Fast-path RX/TX worker + control-plane lcore |
 
@@ -131,8 +135,8 @@ Inbound (upstream → PPPoE):
 - Per-worker TX queues are already implemented (distributor mode allocates
   one TX queue per worker plus queue 0 for the RX lcore and queue N+1 for
   the ctrl lcore); legacy mode still uses a single shared TX queue.
-- IPv6CP negotiates link-local interface identifiers only; IPv6 data forwarding
-  and DHCPv6 are not implemented yet.
+- DHCPv6-PD runs over the negotiated IPv6 link, but general IPv6 data
+  forwarding is not implemented yet.
 - NAT entries are reclaimed by `nat_expire()` after 300 s of idle time;
   the ctrl lcore calls it on a 10 s tick.
 
@@ -161,3 +165,25 @@ BRAS    →  CONF_ACK  [IP=10.64.0.2, DNS1=1.1.1.1, DNS2=8.8.8.8]
 
 If the client doesn't include DNS options in its `CONF_REQ`, the BRAS won't
 push them — only options the client asks for are negotiated.
+
+## DHCPv6 Prefix Delegation
+
+After IPv6CP opens, the BRAS answers DHCPv6 Solicit, Request, Renew, Rebind,
+and Release messages over PPP. Each session receives a deterministic /56 from
+the configured pool. The node uses the delegated /56's first /64 for its LAN.
+The Reply also carries both configured IPv6 DNS servers.
+
+| option | default | description |
+|--------|---------|-------------|
+| `--pd-pool <prefix>/<plen>` | `2001:db8:6400::/48` | Delegated-prefix pool; length must be 1 through 55 and host bits must be zero. |
+| `--pri-dns6 <IPv6>` | `2606:4700:4700::1111` | Primary DNS server in DHCPv6 option 23. |
+| `--sec-dns6 <IPv6>` | `2001:4860:4860::8888` | Secondary DNS server in DHCPv6 option 23. |
+
+Example:
+
+```bash
+./dpdk-bras -l 0-2 -n 4 -- \
+  --pd-pool 2001:db8:64::/48 \
+  --pri-dns6 2606:4700:4700::1111 \
+  --sec-dns6 2001:4860:4860::8888
+```
