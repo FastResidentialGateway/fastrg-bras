@@ -10,6 +10,7 @@ A minimal DPDK-based BRAS implementing:
 - **DHCPv6-PD** deterministic /56 delegation with recursive DNS (RFC 8415)
 - **IPv6 routing** PPP 0x0057 decapsulation/encapsulation with /56 anti-spoofing
 - **NDP/ICMPv6** upstream next-hop discovery and local echo replies
+- **VF reset recovery** parked-lcore port rebuild after PF reset events
 - **SNAT/DNAT** forwarding: PPPoE sessions ↔ upstream server
 
 ---
@@ -144,6 +145,10 @@ Inbound (upstream → PPPoE):
   its data and control lcores must share a device TX queue.
 - IPv6 forwarding uses one configured upstream next-hop and does not perform
   NAT66, generate ICMPv6 forwarding errors, or fragment oversized packets.
+- Autonomous ARP/NS transmission is gated by LAN link state. Unresolved IPv6
+  neighbour discovery retries once per second for 30 sends, then every 10
+  seconds. VF reset callbacks only signal the main-lcore supervisor, which
+  parks datapath lcores, rebuilds affected ports, and restores VLAN filters.
 - NAT entries are reclaimed by `nat_expire()` after 300 s of idle time;
   the ctrl lcore calls it on a 10 s tick.
 
