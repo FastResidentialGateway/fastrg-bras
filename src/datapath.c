@@ -44,6 +44,22 @@ drop_pkt(struct rte_mbuf *m, const char *reason)
     rte_pktmbuf_free(m);
 }
 
+/* Called only at lcore-specific safe points where no mbuf is owned and the
+ * next operation would touch ethdev. Each lcore writes only its own slot. */
+static inline void
+park_current_lcore(void)
+{
+    if (!__atomic_load_n(&g_bras.dp_pause, __ATOMIC_ACQUIRE))
+        return;
+
+    unsigned int me = rte_lcore_id();
+    __atomic_store_n(&g_bras.dp_ack[me], 1, __ATOMIC_RELEASE);
+    while (g_running &&
+           __atomic_load_n(&g_bras.dp_pause, __ATOMIC_ACQUIRE))
+        rte_pause();
+    __atomic_store_n(&g_bras.dp_ack[me], 0, __ATOMIC_RELEASE);
+}
+
 /*
  * Decide if a PPPoE session frame belongs on the control lcore.  IPv4 is
  * always data.  IPv6 is data unless its destination is multicast or the
@@ -434,6 +450,13 @@ rx_dist_lcore(void *arg __rte_unused)
             rte_lcore_id(), g_bras.n_workers);
 
     while (g_running) {
+        if (__atomic_load_n(&g_bras.dp_pause, __ATOMIC_ACQUIRE)) {
+            rte_distributor_process(dist, NULL, 0);
+            rte_distributor_returned_pkts(dist, ret, RTE_DIM(ret));
+            park_current_lcore();
+            continue;
+        }
+
         n_batch = 0;
         nb = rte_eth_rx_burst(WAN_PORT, 0, pkts, BURST_SIZE);
         if (nb > 0)
@@ -483,6 +506,8 @@ dist_worker_lcore(void *arg)
     while (g_running) {
         n = rte_distributor_poll_pkt(dist, wid, bufs);
         if (n < 0) {
+            if (__atomic_load_n(&g_bras.dp_pause, __ATOMIC_ACQUIRE))
+                park_current_lcore();
             rte_pause();
             continue;
         }
@@ -553,6 +578,10 @@ datapath_lcore(void *arg)
             rte_lcore_id(), queue_id);
 
     while (g_running) {
+        park_current_lcore();
+        if (!g_running)
+            break;
+
         /* WAN (client side) */
         nb = rte_eth_rx_burst(WAN_PORT, queue_id, wan_pkts, BURST_SIZE);
         if (nb > 0)
@@ -577,8 +606,9 @@ ctrl_plane_lcore(void *arg __rte_unused)
 {
     void *obj;
     uint64_t last_timer = rte_rdtsc();
-    uint64_t last_arp   = 0;
+    uint64_t last_neighbor_tick = 0;
     uint64_t last_nd6   = 0;
+    uint32_t nd6_attempts = 0;
     const uint64_t timer_interval = rte_get_timer_hz() * 10; /* 10 sec */
     const uint64_t arp_interval   = rte_get_timer_hz();      /*  1 sec */
 
@@ -586,6 +616,16 @@ ctrl_plane_lcore(void *arg __rte_unused)
             rte_lcore_id());
 
     while (g_running) {
+        park_current_lcore();
+        if (!g_running)
+            break;
+
+        if (__atomic_exchange_n(&g_bras.nd6_backoff_reset, 0,
+                                __ATOMIC_ACQ_REL)) {
+            nd6_attempts = 0;
+            last_nd6 = 0;
+        }
+
         if (g_terminate_sessions) {
             g_terminate_sessions = 0;
             for (int i = 1; i <= MAX_SESSIONS; i++) {
@@ -604,20 +644,29 @@ ctrl_plane_lcore(void *arg __rte_unused)
             }
         }
 
-        /* Resolve the upstream next-hop MAC before traffic can flow */
-        if (!g_bras.upstream_mac_valid) {
-            uint64_t t = rte_rdtsc();
-            if (t - last_arp >= arp_interval) {
-                last_arp = t;
-                arp_request_upstream();
-            }
-        }
+        /* Gate autonomous neighbour discovery on the cached LAN link state.
+         * ARP remains at 1 Hz; unresolved IPv6 backs off after 30 sends. */
+        uint64_t neighbour_now = rte_rdtsc();
+        if ((!g_bras.upstream_mac_valid || !g_bras.upstream_mac6_valid) &&
+            neighbour_now - last_neighbor_tick >= arp_interval) {
+            last_neighbor_tick = neighbour_now;
+            struct rte_eth_link link;
+            memset(&link, 0, sizeof(link));
+            if (rte_eth_link_get_nowait(LAN_PORT, &link) == 0 &&
+                link.link_status == RTE_ETH_LINK_UP) {
+                if (!g_bras.upstream_mac_valid)
+                    arp_request_upstream();
 
-        if (!g_bras.upstream_mac6_valid) {
-            uint64_t t = rte_rdtsc();
-            if (t - last_nd6 >= arp_interval) {
-                last_nd6 = t;
-                nd6_request_upstream();
+                uint64_t nd6_interval = nd6_attempts <
+                    ND6_REQ_FAST_ATTEMPTS ? arp_interval :
+                    rte_get_timer_hz() * ND6_REQ_SLOW_INTERVAL_SEC;
+                if (!g_bras.upstream_mac6_valid &&
+                    (last_nd6 == 0 ||
+                     neighbour_now - last_nd6 >= nd6_interval)) {
+                    last_nd6 = neighbour_now;
+                    nd6_request_upstream();
+                    nd6_attempts++;
+                }
             }
         }
 

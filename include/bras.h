@@ -43,6 +43,8 @@
 /* LCore assignment */
 #define LCORE_CTRL          2           /* control plane: PPPoE/PPP/DHCPv6 */
 #define MAX_DIST_WORKERS    8           /* max distributor worker lcores */
+#define ND6_REQ_FAST_ATTEMPTS       30
+#define ND6_REQ_SLOW_INTERVAL_SEC   10
 
 /* =====================================================================
  * PPPoE Protocol Constants  (RFC 2516)
@@ -372,6 +374,17 @@ struct bras_ctx {
     uint16_t            lcore_queue[RTE_MAX_LCORE];
     uint8_t             tx_queue_shared; /* serialize TX only when legacy
                                           * lcores share a hardware queue */
+
+    /* Port-reset park protocol. Main writes dp_pause, claims reset pending,
+     * and requeues degraded ports; the interrupt thread only sets pending.
+     * Each datapath lcore writes only its own dp_ack slot. */
+    volatile uint8_t    dp_pause;
+    volatile uint8_t    dp_ack[RTE_MAX_LCORE];
+    volatile uint8_t    port_reset_pending[2];
+    volatile uint8_t    nd6_backoff_reset; /* main sets, ctrl consumes */
+    uint8_t             n_dp_lcores;
+    uint16_t            cfg_n_rxq;
+    uint16_t            cfg_n_txq;
 
     /* Software distributor datapath (X520/82599 VF cannot RSS PPPoE: the
      * inner IP is hidden behind the PPPoE header, so hardware always lands

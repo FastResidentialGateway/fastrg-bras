@@ -20,6 +20,7 @@
 #include <signal.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <errno.h>
 #include <getopt.h>
 #include <arpa/inet.h>
 #include <sys/time.h>
@@ -61,8 +62,93 @@ enum {
 /* ── port configuration ───────────────────────────────────────────────── */
 
 static int
-port_init(uint16_t port, struct rte_mempool *pool,
-          uint16_t n_rxq, uint16_t n_txq)
+bras_ethdev_event_cb(uint16_t port, enum rte_eth_event_type event,
+                     void *cb_arg __rte_unused, void *ret_param __rte_unused)
+{
+    if (port > LAN_PORT)
+        return 0;
+
+    if (event == RTE_ETH_EVENT_INTR_RESET) {
+        RTE_LOG(WARNING, MAIN, "VF reset event on port %u\n", port);
+        __atomic_store_n(&g_bras.port_reset_pending[port], 1,
+                         __ATOMIC_RELEASE);
+    } else if (event == RTE_ETH_EVENT_INTR_LSC) {
+        struct rte_eth_link link;
+        memset(&link, 0, sizeof(link));
+        int ret = rte_eth_link_get_nowait(port, &link);
+        RTE_LOG(INFO, MAIN, "port %u link %s\n", port,
+                ret == 0 ? (link.link_status == RTE_ETH_LINK_UP ?
+                            "up" : "down") : "unknown");
+    }
+    return 0;
+}
+
+/* Reapply VLAN membership lost when a PF resets its VF. A filter that was
+ * previously accepted is required during recovery; a filter that the PF
+ * already refused remains the expected port-VLAN case. */
+static int
+restore_vlan_filters(uint16_t port, int strict)
+{
+    if (port != WAN_PORT)
+        return 0;
+
+    for (uint16_t vid = 1; vid <= 4094; vid++) {
+        uint8_t previous = g_bras.vlan_registered[vid];
+        if (!g_bras.vlan_allowed[vid] && previous == 0)
+            continue;
+
+        int ret = rte_eth_dev_vlan_filter(port, vid, 1);
+        if (ret == 0) {
+            g_bras.vlan_registered[vid] = 1;
+            continue;
+        }
+
+        if (strict && previous == 1) {
+            RTE_LOG(ERR, MAIN,
+                    "port %u failed to restore VLAN %u filter: %s\n",
+                    port, vid, strerror(-ret));
+            return ret;
+        }
+        g_bras.vlan_registered[vid] = 2;
+    }
+    return 0;
+}
+
+static int
+restore_post_start(uint16_t port, int strict)
+{
+    int ret = rte_eth_promiscuous_enable(port);
+    if (ret != 0)
+        RTE_LOG(WARNING, MAIN,
+                "rte_eth_promiscuous_enable(%u) failed: %s — "
+                "foreign-MAC RX will not work\n", port, strerror(-ret));
+
+    if (port == LAN_PORT && g_bras.lan_alias_mac_set) {
+        ret = rte_eth_dev_mac_addr_add(port, &g_bras.lan_alias_mac, 0);
+        if (ret == 0 || ret == -EEXIST) {
+            RTE_LOG(INFO, MAIN,
+                    "LAN alias MAC " RTE_ETHER_ADDR_PRT_FMT " added\n",
+                    RTE_ETHER_ADDR_BYTES(&g_bras.lan_alias_mac));
+        } else {
+            if (strict) {
+                RTE_LOG(ERR, MAIN,
+                        "rte_eth_dev_mac_addr_add(LAN alias) failed: %s\n",
+                        strerror(-ret));
+                return ret;
+            }
+            RTE_LOG(WARNING, MAIN,
+                    "rte_eth_dev_mac_addr_add(LAN alias) failed: %s\n",
+                    strerror(-ret));
+        }
+    }
+
+    return restore_vlan_filters(port, strict);
+}
+
+static int
+port_configure_start(uint16_t port, struct rte_mempool *pool,
+                     uint16_t n_rxq, uint16_t n_txq,
+                     int register_callbacks, int strict_restore)
 {
     struct rte_eth_dev_info dev_info;
     int ret;
@@ -87,6 +173,7 @@ port_init(uint16_t port, struct rte_mempool *pool,
     struct rte_eth_conf conf = {
         .rxmode = { .mq_mode = RTE_ETH_MQ_RX_NONE },
         .txmode = { .mq_mode = RTE_ETH_MQ_TX_NONE },
+        .intr_conf = { .lsc = 1 },
     };
 
     /* Enable RSS when spreading RX over multiple queues (legacy mode only;
@@ -114,9 +201,38 @@ port_init(uint16_t port, struct rte_mempool *pool,
         conf.rxmode.offloads |= RTE_ETH_RX_OFFLOAD_VLAN_FILTER;
 
     ret = rte_eth_dev_configure(port, n_rxq, n_txq, &conf);
+    if (ret == -ENOTSUP ||
+        (ret == -EINVAL &&
+         (!dev_info.dev_flags ||
+          !(*dev_info.dev_flags & RTE_ETH_DEV_INTR_LSC)))) {
+        conf.intr_conf.lsc = 0;
+        RTE_LOG(INFO, MAIN,
+                "port %u LSC interrupt unsupported; retrying without LSC\n",
+                port);
+        ret = rte_eth_dev_configure(port, n_rxq, n_txq, &conf);
+    }
     if (ret < 0) {
         RTE_LOG(ERR, MAIN, "rte_eth_dev_configure(%u): %d\n", port, ret);
         return ret;
+    }
+
+    if (register_callbacks) {
+        ret = rte_eth_dev_callback_register(port, RTE_ETH_EVENT_INTR_RESET,
+                                            bras_ethdev_event_cb, NULL);
+        if (ret != 0) {
+            RTE_LOG(ERR, MAIN,
+                    "cannot register reset callback on port %u: %s\n",
+                    port, strerror(-ret));
+            return ret;
+        }
+        ret = rte_eth_dev_callback_register(port, RTE_ETH_EVENT_INTR_LSC,
+                                            bras_ethdev_event_cb, NULL);
+        if (ret != 0) {
+            RTE_LOG(ERR, MAIN,
+                    "cannot register LSC callback on port %u: %s\n",
+                    port, strerror(-ret));
+            return ret;
+        }
     }
 
     uint16_t nb_rx = 512, nb_tx = 512;
@@ -145,26 +261,9 @@ port_init(uint16_t port, struct rte_mempool *pool,
         return ret;
     }
 
-    /* Promiscuous RX is required on the LAN side: the e2e bench injects
-     * frames addressed to the fastrg-node WAN MAC, not ours. */
-    ret = rte_eth_promiscuous_enable(port);
+    ret = restore_post_start(port, strict_restore);
     if (ret != 0)
-        RTE_LOG(WARNING, MAIN,
-                "rte_eth_promiscuous_enable(%u) failed: %s — "
-                "foreign-MAC RX will not work\n", port, strerror(-ret));
-
-    /* The 82599 VF silently ignores promiscuous without PF trust, so also
-     * register the bench's foreign dst MAC as a real unicast filter. */
-    if (port == LAN_PORT && g_bras.lan_alias_mac_set) {
-        ret = rte_eth_dev_mac_addr_add(port, &g_bras.lan_alias_mac, 0);
-        if (ret == 0)
-            RTE_LOG(INFO, MAIN,
-                    "LAN alias MAC " RTE_ETHER_ADDR_PRT_FMT " added\n",
-                    RTE_ETHER_ADDR_BYTES(&g_bras.lan_alias_mac));
-        else
-            RTE_LOG(WARNING, MAIN,
-                    "rte_eth_dev_mac_addr_add(LAN alias) failed: %s\n", strerror(-ret));
-    }
+        return ret;
 
     if (port == WAN_PORT)
         rte_eth_macaddr_get(port, &g_bras.wan_mac);
@@ -177,6 +276,111 @@ port_init(uint16_t port, struct rte_mempool *pool,
             RTE_ETHER_ADDR_BYTES(port == WAN_PORT ? &g_bras.wan_mac
                                                   : &g_bras.lan_mac));
     return 0;
+}
+
+static int
+port_init(uint16_t port, struct rte_mempool *pool,
+          uint16_t n_rxq, uint16_t n_txq)
+{
+    return port_configure_start(port, pool, n_rxq, n_txq, 1, 0);
+}
+
+static int
+port_reinit(uint16_t port)
+{
+    return port_configure_start(port, g_bras.pktmbuf_pool,
+                                g_bras.cfg_n_rxq, g_bras.cfg_n_txq, 0, 1);
+}
+
+#define PORT_REINIT_ATTEMPTS       30
+#define PORT_REINIT_DELAY_US       300000
+#define PARK_WARN_INTERVAL_SEC     2
+
+static uint8_t
+parked_lcore_count(void)
+{
+    uint8_t count = 0;
+    unsigned int lcore;
+
+    RTE_LCORE_FOREACH_WORKER(lcore) {
+        if (__atomic_load_n(&g_bras.dp_ack[lcore], __ATOMIC_ACQUIRE))
+            count++;
+    }
+    return count;
+}
+
+/* Main-lcore supervisor: atomically claims pending reset events, parks every
+ * lcore that may touch ethdev, then rebuilds all affected ports in one pause. */
+static void
+recover_reset_ports(void)
+{
+    uint8_t pending[2];
+    int any_pending = 0;
+
+    for (uint16_t port = WAN_PORT; port <= LAN_PORT; port++) {
+        pending[port] = __atomic_exchange_n(
+            &g_bras.port_reset_pending[port], 0, __ATOMIC_ACQ_REL);
+        any_pending |= pending[port];
+    }
+    if (!any_pending)
+        return;
+
+    __atomic_store_n(&g_bras.dp_pause, 1, __ATOMIC_RELEASE);
+    uint64_t warn_at = rte_rdtsc() +
+        rte_get_timer_hz() * PARK_WARN_INTERVAL_SEC;
+    while (g_running && parked_lcore_count() < g_bras.n_dp_lcores) {
+        uint64_t now = rte_rdtsc();
+        if (now >= warn_at) {
+            RTE_LOG(WARNING, MAIN,
+                    "waiting for datapath park: %u/%u lcores\n",
+                    parked_lcore_count(), g_bras.n_dp_lcores);
+            warn_at = now + rte_get_timer_hz() * PARK_WARN_INTERVAL_SEC;
+        }
+        rte_pause();
+    }
+
+    if (!g_running)
+        goto resume_datapath;
+
+    for (uint16_t port = WAN_PORT; port <= LAN_PORT; port++) {
+        if (!pending[port])
+            continue;
+
+        int ret = rte_eth_dev_stop(port);
+        if (ret != 0)
+            RTE_LOG(WARNING, MAIN, "rte_eth_dev_stop(%u): %s\n",
+                    port, strerror(-ret));
+
+        int recovered = 0;
+        for (unsigned int attempt = 1;
+             attempt <= PORT_REINIT_ATTEMPTS && g_running; attempt++) {
+            ret = port_reinit(port);
+            if (ret == 0) {
+                recovered = 1;
+                RTE_LOG(INFO, MAIN,
+                        "port %u recovered after VF reset\n", port);
+                __atomic_store_n(&g_bras.nd6_backoff_reset, 1,
+                                 __ATOMIC_RELEASE);
+                break;
+            }
+
+            if (attempt < PORT_REINIT_ATTEMPTS) {
+                usleep(PORT_REINIT_DELAY_US);
+                rte_eth_dev_stop(port);
+            }
+        }
+
+        if (!recovered && g_running) {
+            RTE_LOG(ERR, MAIN,
+                    "port %u recovery degraded after VF reset; will retry\n",
+                    port);
+            __atomic_store_n(&g_bras.port_reset_pending[port], 1,
+                             __ATOMIC_RELEASE);
+        }
+    }
+
+resume_datapath:
+    __atomic_store_n(&g_bras.dp_pause, 0, __ATOMIC_RELEASE);
 }
 
 /* ── utility implementations ─────────────────────────────────────────── */
@@ -836,6 +1040,10 @@ main(int argc, char *argv[])
     }
 
     /* ── Port init ───────────────────────────────────────────────────── */
+    g_bras.cfg_n_rxq = n_rxq;
+    g_bras.cfg_n_txq = n_txq;
+    g_bras.n_dp_lcores = g_bras.dist ?
+        (uint8_t)(g_bras.n_workers + 2) : (uint8_t)(n_data + 1);
     if (port_init(WAN_PORT, g_bras.pktmbuf_pool, n_rxq, n_txq) != 0) return 1;
     if (port_init(LAN_PORT, g_bras.pktmbuf_pool, n_rxq, n_txq) != 0) return 1;
     ipv6_addr_init();
@@ -947,9 +1155,14 @@ main(int argc, char *argv[])
     }
     rte_eal_remote_launch(ctrl_plane_lcore, NULL, LCORE_CTRL);
 
-    /* ── Main loop: print stats, wait for SIGINT ─────────────────────── */
+    /* ── Main loop: 500 ms reset supervisor, stats every 5 seconds ──── */
+    unsigned int supervisor_ticks = 0;
     while (g_running) {
-        sleep(5);
+        usleep(500000);
+        recover_reset_ports();
+        if (++supervisor_ticks < 10)
+            continue;
+        supervisor_ticks = 0;
         printf("[BRAS] sessions_up=%-4lu  rx=%-10lu  tx=%-10lu  drop=%-6lu",
                g_bras.stat_sessions_up,
                g_bras.stat_pkts_rx,
