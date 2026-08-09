@@ -54,6 +54,8 @@ enum {
     OPT_PD_POOL = 256,
     OPT_PRI_DNS6,
     OPT_SEC_DNS6,
+    OPT_LAN_IP6,
+    OPT_UPSTREAM_IP6,
 };
 
 /* ── port configuration ───────────────────────────────────────────────── */
@@ -195,8 +197,17 @@ alloc_pkt(uint16_t data_room)
 void
 send_pkt(uint16_t port, struct rte_mbuf *mbuf)
 {
+    static rte_spinlock_t tx_queue_locks[RTE_MAX_ETHPORTS][MAX_RX_QUEUES];
     uint16_t queue = g_bras.lcore_queue[rte_lcore_id()];
-    uint16_t sent  = rte_eth_tx_burst(port, queue, &mbuf, 1);
+    uint16_t sent;
+
+    if (unlikely(g_bras.tx_queue_shared)) {
+        rte_spinlock_lock(&tx_queue_locks[port][queue]);
+        sent = rte_eth_tx_burst(port, queue, &mbuf, 1);
+        rte_spinlock_unlock(&tx_queue_locks[port][queue]);
+    } else {
+        sent = rte_eth_tx_burst(port, queue, &mbuf, 1);
+    }
     if (sent == 0) {
         g_bras.stat_pkts_dropped++;
         g_bras.stat_drop_txfull++;
@@ -503,6 +514,8 @@ usage(const char *prog)
         "  --sec-dns <IP>      Secondary DNS via IPCP(default 8.8.8.8)\n"
         "  --pd-pool <P/L>     DHCPv6-PD /56 pool; pool plen 1..55\n"
         "                      (default 2001:db8:6400::/48)\n"
+        "  --lan-ip6 <IPv6>    Our LAN-side IPv6   (default 2001:db8:201::1)\n"
+        "  --upstream-ip6 <V6> IPv6 next-hop       (default 2001:db8:201::11)\n"
         "  --pri-dns6 <IPv6>   Primary DHCPv6 DNS   (default 2606:4700:4700::1111)\n"
         "  --sec-dns6 <IPv6>   Secondary DHCPv6 DNS (default 2001:4860:4860::8888)\n"
         "  --auth <pap|chap>   PPP authentication    (default pap)\n"
@@ -560,6 +573,8 @@ main(int argc, char *argv[])
     g_bras.pri_dns       = DEFAULT_PRI_DNS;
     g_bras.sec_dns       = DEFAULT_SEC_DNS;
     if (parse_pd_pool("2001:db8:6400::/48") != 0 ||
+        inet_pton(AF_INET6, "2001:db8:201::1", g_bras.lan_ip6) != 1 ||
+        inet_pton(AF_INET6, "2001:db8:201::11", g_bras.upstream_ip6) != 1 ||
         inet_pton(AF_INET6, "2606:4700:4700::1111", g_bras.dns6_pri) != 1 ||
         inet_pton(AF_INET6, "2001:4860:4860::8888", g_bras.dns6_sec) != 1) {
         fprintf(stderr, "Invalid built-in DHCPv6 defaults\n");
@@ -582,6 +597,8 @@ main(int argc, char *argv[])
         { "pri-dns",       required_argument, NULL, '1' },
         { "sec-dns",       required_argument, NULL, '2' },
         { "pd-pool",       required_argument, NULL, OPT_PD_POOL },
+        { "lan-ip6",       required_argument, NULL, OPT_LAN_IP6 },
+        { "upstream-ip6",  required_argument, NULL, OPT_UPSTREAM_IP6 },
         { "pri-dns6",      required_argument, NULL, OPT_PRI_DNS6 },
         { "sec-dns6",      required_argument, NULL, OPT_SEC_DNS6 },
         { "auth",          required_argument, NULL, 'a' },
@@ -626,6 +643,15 @@ main(int argc, char *argv[])
                         "Bad --pd-pool: %s (expected network prefix with "
                         "length 1..55 and zero host bits)\n",
                         optarg);
+                return 1;
+            }
+            continue;
+        }
+        if (opt == OPT_LAN_IP6 || opt == OPT_UPSTREAM_IP6) {
+            uint8_t *address = opt == OPT_LAN_IP6 ?
+                g_bras.lan_ip6 : g_bras.upstream_ip6;
+            if (inet_pton(AF_INET6, optarg, address) != 1) {
+                fprintf(stderr, "Bad IPv6 address argument: %s\n", optarg);
                 return 1;
             }
             continue;
@@ -793,21 +819,26 @@ main(int argc, char *argv[])
                 "datapath: software distributor — RX lcore %u, %u worker(s)\n",
                 data_lcores[0], n_workers);
     } else {
-        /* Legacy: data lcores poll their own RSS queue pair inline */
+        /* Legacy: map lcores onto the TX queues the device actually has.
+         * Single-queue vdevs share queue 0 between data and control traffic. */
         for (uint16_t i = 0; i < n_data; i++)
-            g_bras.lcore_queue[data_lcores[i]] = i;
-        g_bras.lcore_queue[LCORE_CTRL] = n_data;
+            g_bras.lcore_queue[data_lcores[i]] = i % max_txq;
+        g_bras.lcore_queue[LCORE_CTRL] = n_data % max_txq;
+        g_bras.tx_queue_shared = n_data + 1 > max_txq;
         g_bras.n_queues = n_data;
         n_rxq = n_data;
-        n_txq = n_data + 1;
+        n_txq = RTE_MIN(n_data + 1, max_txq);
         RTE_LOG(INFO, MAIN,
-                "datapath: legacy inline (%u data lcore(s), max_txq=%u)\n",
-                n_data, max_txq);
+                "datapath: legacy inline (%u data lcore(s), max_txq=%u, "
+                "shared_tx=%s)\n",
+                n_data, max_txq,
+                g_bras.tx_queue_shared ? "locked" : "no");
     }
 
     /* ── Port init ───────────────────────────────────────────────────── */
     if (port_init(WAN_PORT, g_bras.pktmbuf_pool, n_rxq, n_txq) != 0) return 1;
     if (port_init(LAN_PORT, g_bras.pktmbuf_pool, n_rxq, n_txq) != 0) return 1;
+    ipv6_addr_init();
 
     /* Enable runtime full-traffic capture: with this, dpdk-dumpcap can be
      * attached on demand (e.g. `dpdk-dumpcap -i 0 -w /tmp/all.pcapng`)
@@ -891,6 +922,18 @@ main(int argc, char *argv[])
             "DHCPv6-PD: pool=%s/%u primary_dns=%s secondary_dns=%s\n",
             pd_pool_text, g_bras.pd_pool_plen,
             dns6_pri_text, dns6_sec_text);
+
+    char lan_ip6_text[INET6_ADDRSTRLEN];
+    char upstream_ip6_text[INET6_ADDRSTRLEN];
+    char lan_ll_text[INET6_ADDRSTRLEN];
+    char wan_ll_text[INET6_ADDRSTRLEN];
+    format_ipv6(g_bras.lan_ip6, lan_ip6_text);
+    format_ipv6(g_bras.upstream_ip6, upstream_ip6_text);
+    format_ipv6(g_bras.lan_ip6_ll, lan_ll_text);
+    format_ipv6(g_bras.wan_ll, wan_ll_text);
+    RTE_LOG(INFO, MAIN,
+            "IPv6 dataplane: lan=%s lan_ll=%s upstream=%s wan_ll=%s\n",
+            lan_ip6_text, lan_ll_text, upstream_ip6_text, wan_ll_text);
 
     if (g_bras.dist) {
         rte_eal_remote_launch(rx_dist_lcore, NULL, data_lcores[0]);

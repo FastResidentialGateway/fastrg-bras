@@ -565,16 +565,7 @@ ipv6cp_send_conf_req(struct bras_session *sess, int new_identifier)
 void
 ipv6cp_start(struct bras_session *sess)
 {
-    const uint8_t *mac = g_bras.wan_mac.addr_bytes;
-
-    sess->local_ifid[0] = mac[0] ^ 0x02;
-    sess->local_ifid[1] = mac[1];
-    sess->local_ifid[2] = mac[2];
-    sess->local_ifid[3] = 0xff;
-    sess->local_ifid[4] = 0xfe;
-    sess->local_ifid[5] = mac[3];
-    sess->local_ifid[6] = mac[4];
-    sess->local_ifid[7] = mac[5];
+    ipv6_mac_to_ifid(&g_bras.wan_mac, sess->local_ifid);
     sess->ipv6cp_state = IPV6CP_NEGOTIATING;
     sess->ipv6cp_local_acked = 0;
     sess->ipv6cp_attempts = 0;
@@ -791,7 +782,8 @@ ipv6cp_handle(struct bras_session *sess, struct lcp_hdr *lcp, uint16_t len)
  * ppp_handle_ctrl — entry point for PPP control packets and IPv6 packets
  * handled by control-plane services such as DHCPv6.
  * Called from ctrl_plane_lcore() for every PPPoE session frame whose PPP
- * protocol is NOT 0x0021 (IP data).
+ * protocol is control traffic, or 0x0057 addressed to a local/multicast
+ * control-plane destination.
  */
 void
 ppp_handle_ctrl(struct rte_mbuf *mbuf, uint16_t session_id)
@@ -821,8 +813,8 @@ ppp_handle_ctrl(struct rte_mbuf *mbuf, uint16_t session_id)
     uint16_t proto = ntohs(pph->protocol);
 
     if (proto == PPP_IPV6) {
-        dhcpv6_input(sess, base + off,
-                     (uint16_t)(rte_pktmbuf_pkt_len(mbuf) - off));
+        ipv6_ctrl_input(sess, base + off,
+                        (uint16_t)(rte_pktmbuf_pkt_len(mbuf) - off));
         rte_pktmbuf_free(mbuf);
         return;
     }

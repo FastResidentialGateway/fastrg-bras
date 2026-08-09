@@ -8,6 +8,8 @@ A minimal DPDK-based BRAS implementing:
 - **IPCP DNS push** — primary/secondary DNS via options 129/131 (RFC 1877)
 - **IPv6CP** interface-identifier negotiation (RFC 5072)
 - **DHCPv6-PD** deterministic /56 delegation with recursive DNS (RFC 8415)
+- **IPv6 routing** PPP 0x0057 decapsulation/encapsulation with /56 anti-spoofing
+- **NDP/ICMPv6** upstream next-hop discovery and local echo replies
 - **SNAT/DNAT** forwarding: PPPoE sessions ↔ upstream server
 
 ---
@@ -45,7 +47,8 @@ NIC connected to dpdk-bras's WAN port. The BRAS will:
    - Session 2 → server `10.64.0.5`, client `10.64.0.6`
    - Session N → server `10.64.0.(N-1)*4+1`, client `+1`
 5. Delegate a deterministic IPv6 /56 after IPv6CP opens
-6. Route client IPv4 data to upstream server via SNAT
+6. Route delegated IPv6 prefixes between PPPoE and the upstream LAN
+7. Route client IPv4 data to upstream server via SNAT
 
 ---
 
@@ -60,7 +63,9 @@ make
 
 # Example Run
 ./dpdk-bras -l 0-5 -n 4 -- --pri-dns 192.168.10.1 \
-  --pd-pool 2001:db8:6400::/48 --drop-pcap ./test.pcap --vlans 3,5
+  --pd-pool 2001:db8:6400::/48 \
+  --lan-ip6 2001:db8:201::1 --upstream-ip6 2001:db8:201::11 \
+  --drop-pcap ./test.pcap --vlans 3,5
 ```
 
 ---
@@ -96,8 +101,8 @@ WAN RX burst
   ├── ethertype 0x8863 (PPPoE Discovery) ──► ctrl_ring ──► pppoe_handle_discovery()
   └── ethertype 0x8864 (PPPoE Session)
         ├── session not UP ──────────────► ctrl_ring ──► ppp_handle_ctrl()
-        ├── PPP proto ≠ 0x0021 (ctrl) ───► ctrl_ring ──► ppp_handle_ctrl()
-        └── PPP proto = 0x0021 (IP data)
+        ├── PPP control or local/multicast 0x0057 ─► ctrl_ring ─► ppp_handle_ctrl()
+        └── PPP proto = 0x0021 or global-dst 0x0057 data
               ├── distributor mode ───────► flow-tag + rte_distributor ──► worker: route_outbound() ──► LAN TX
               └── legacy mode ────────────► route_outbound() inline ──► LAN TX
 ```
@@ -123,6 +128,7 @@ Inbound (upstream → PPPoE):
 | `src/pppoe.c` | PPPoE Discovery state machine |
 | `src/ppp.c` | LCP/IPCP/IPv6CP/CHAP/PAP control plane |
 | `src/dhcpv6.c` | DHCPv6 prefix delegation and DNS replies |
+| `src/ipv6.c` | IPv6 routing, NDP, and ICMPv6 responders |
 | `src/nat.c` | SNAT/DNAT engine with rte_hash tables |
 | `src/datapath.c` | Fast-path RX/TX worker + control-plane lcore |
 
@@ -134,9 +140,10 @@ Inbound (upstream → PPPoE):
   RADIUS or local credential lookup for real deployments.
 - Per-worker TX queues are already implemented (distributor mode allocates
   one TX queue per worker plus queue 0 for the RX lcore and queue N+1 for
-  the ctrl lcore); legacy mode still uses a single shared TX queue.
-- DHCPv6-PD runs over the negotiated IPv6 link, but general IPv6 data
-  forwarding is not implemented yet.
+  the ctrl lcore). Legacy mode serializes `rte_eth_tx_burst()` only when
+  its data and control lcores must share a device TX queue.
+- IPv6 forwarding uses one configured upstream next-hop and does not perform
+  NAT66, generate ICMPv6 forwarding errors, or fragment oversized packets.
 - NAT entries are reclaimed by `nat_expire()` after 300 s of idle time;
   the ctrl lcore calls it on a 10 s tick.
 
@@ -176,6 +183,8 @@ The Reply also carries both configured IPv6 DNS servers.
 | option | default | description |
 |--------|---------|-------------|
 | `--pd-pool <prefix>/<plen>` | `2001:db8:6400::/48` | Delegated-prefix pool; length must be 1 through 55 and host bits must be zero. |
+| `--lan-ip6 <IPv6>` | `2001:db8:201::1` | BRAS global IPv6 address on the upstream LAN. |
+| `--upstream-ip6 <IPv6>` | `2001:db8:201::11` | Single IPv6 next-hop used by delegated-prefix traffic. |
 | `--pri-dns6 <IPv6>` | `2606:4700:4700::1111` | Primary DNS server in DHCPv6 option 23. |
 | `--sec-dns6 <IPv6>` | `2001:4860:4860::8888` | Secondary DNS server in DHCPv6 option 23. |
 
