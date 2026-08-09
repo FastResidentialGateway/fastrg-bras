@@ -4,7 +4,8 @@
  *   main:          ipv6_addr_init()
  *   RX/classify:   ipv6_lan_input() (LAN NDP and local echo, inline)
  *   data workers:  ipv6_route_outbound(), ipv6_route_inbound()
- *   LCORE_CTRL:    nd6_request_upstream(), ipv6_ctrl_input()
+ *   LCORE_CTRL:    nd6_request_upstream(), nd6_announce_local(),
+ *                  ipv6_ctrl_input()
  *
  * The upstream side uses one configured IPv6 next-hop.  Its MAC is learned
  * with NDP and then published to the forwarding workers through a valid flag.
@@ -459,6 +460,48 @@ nd6_request_upstream(void)
     sll->length = 1;
     memcpy(sll->mac, g_bras.lan_mac.addr_bytes, sizeof(sll->mac));
     icmp6_checksum(ip6, &ns->icmp);
+    send_pkt(LAN_PORT, m);
+}
+
+/* LCORE_CTRL: announce the LAN IPv6 address after a port rebuild. */
+void
+nd6_announce_local(void)
+{
+    uint16_t total = sizeof(struct rte_ether_hdr) +
+                     sizeof(struct rte_ipv6_hdr) + ND6_MESSAGE_LEN;
+    struct rte_mbuf *m = alloc_pkt(total);
+    if (!m)
+        return;
+
+    struct rte_ether_hdr *eth = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
+    eth->dst_addr = (struct rte_ether_addr)
+        { .addr_bytes = {0x33, 0x33, 0x00, 0x00, 0x00, 0x01} };
+    rte_ether_addr_copy(&g_bras.lan_mac, &eth->src_addr);
+    eth->ether_type = htons(RTE_ETHER_TYPE_IPV6);
+
+    struct rte_ipv6_hdr *ip6 = (struct rte_ipv6_hdr *)(eth + 1);
+    memset(ip6, 0, sizeof(*ip6));
+    ip6->vtc_flow = rte_cpu_to_be_32(UINT32_C(6) << 28);
+    ip6->payload_len = htons(ND6_MESSAGE_LEN);
+    ip6->proto = IPPROTO_ICMPV6;
+    ip6->hop_limits = 255;
+    memcpy(&ip6->src_addr, g_bras.lan_ip6, 16);
+    uint8_t all_nodes[16] = {0xff, 0x02};
+    all_nodes[15] = 0x01;
+    memcpy(&ip6->dst_addr, all_nodes, sizeof(all_nodes));
+
+    struct nd6_message *na = (struct nd6_message *)(ip6 + 1);
+    memset(na, 0, ND6_MESSAGE_LEN);
+    na->icmp.type = ICMPV6_NA;
+    na->icmp.data = htonl(0xa0000000u); /* router + override, unsolicited */
+    memcpy(na->target, g_bras.lan_ip6, sizeof(na->target));
+    struct nd6_ll_option *tll =
+        (struct nd6_ll_option *)((uint8_t *)na + sizeof(*na));
+    tll->type = ND6_OPT_TLL;
+    tll->length = 1;
+    memcpy(tll->mac, g_bras.lan_mac.addr_bytes, sizeof(tll->mac));
+    icmp6_checksum(ip6, &na->icmp);
+
     send_pkt(LAN_PORT, m);
 }
 

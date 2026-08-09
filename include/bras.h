@@ -45,6 +45,10 @@
 #define MAX_DIST_WORKERS    8           /* max distributor worker lcores */
 #define ND6_REQ_FAST_ATTEMPTS       30
 #define ND6_REQ_SLOW_INTERVAL_SEC   10
+#define PORT_READY_POLL_MS          100
+#define PORT_READY_WAIT_MS          10000
+#define PORT_REINIT_ATTEMPTS        5
+#define PORT_REINIT_DELAY_US        200000
 
 /* =====================================================================
  * PPPoE Protocol Constants  (RFC 2516)
@@ -382,6 +386,7 @@ struct bras_ctx {
     volatile uint8_t    dp_ack[RTE_MAX_LCORE];
     volatile uint8_t    port_reset_pending[2];
     volatile uint8_t    nd6_backoff_reset; /* main sets, ctrl consumes */
+    volatile uint8_t    warmup_pending;    /* main sets, ctrl consumes */
     uint8_t             n_dp_lcores;
     uint16_t            cfg_n_rxq;
     uint16_t            cfg_n_txq;
@@ -514,6 +519,7 @@ int  ctrl_plane_lcore(void *arg);
 /* arp.c — LAN-side ARP + local ICMP echo responder */
 void arp_input(struct rte_mbuf *mbuf);          /* consumes mbuf */
 void arp_request_upstream(void);
+void arp_announce_local(void);                  /* ctrl lcore */
 int  lan_icmp_echo_input(struct rte_mbuf *mbuf); /* 0 = consumed */
 
 /* ipv6.c — callers/lcores are documented at each implementation. */
@@ -526,6 +532,7 @@ int  ipv6_route_inbound(struct rte_mbuf *mbuf);    /* data worker */
 void ipv6_ctrl_input(struct bras_session *sess,
                      const uint8_t *ip6, uint16_t len); /* ctrl lcore */
 void nd6_request_upstream(void);                   /* ctrl lcore */
+void nd6_announce_local(void);                     /* ctrl lcore */
 
 /* utils.c */
 struct rte_mbuf *alloc_pkt(uint16_t data_room);

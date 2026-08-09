@@ -148,7 +148,12 @@ Inbound (upstream → PPPoE):
 - Autonomous ARP/NS transmission is gated by LAN link state. Unresolved IPv6
   neighbour discovery retries once per second for 30 sends, then every 10
   seconds. VF reset callbacks only signal the main-lcore supervisor, which
-  parks datapath lcores, rebuilds affected ports, and restores VLAN filters.
+  waits up to 10 seconds for link readiness without pausing traffic, then parks
+  datapath lcores, rebuilds affected ports, and restores VLAN filters. The
+  control lcore sends one gratuitous ARP and unsolicited NA after recovery.
+  No WAN warm-up is needed because PPPoE uses session IDs rather than neighbour
+  discovery, and port rebuild already restores the VF's MAC filters.
+- Runtime log lines use local-time `[YYYY-MM-DD HH:MM:SS.mmm] ` prefixes.
 - NAT entries are reclaimed by `nat_expire()` after 300 s of idle time;
   the ctrl lcore calls it on a 10 s tick.
 

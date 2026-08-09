@@ -123,6 +123,35 @@ arp_request_upstream(void)
     send_pkt(LAN_PORT, m);
 }
 
+/* LCORE_CTRL: announce the LAN IPv4 address after a port rebuild. */
+void
+arp_announce_local(void)
+{
+    struct rte_mbuf *m = alloc_pkt(sizeof(struct rte_ether_hdr) +
+                                   sizeof(struct rte_arp_hdr));
+    if (!m)
+        return;
+
+    struct rte_ether_hdr *eth = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
+    struct rte_arp_hdr *arp = (struct rte_arp_hdr *)(eth + 1);
+
+    memset(&eth->dst_addr, 0xff, RTE_ETHER_ADDR_LEN);
+    rte_ether_addr_copy(&g_bras.lan_mac, &eth->src_addr);
+    eth->ether_type = htons(RTE_ETHER_TYPE_ARP);
+
+    arp->arp_hardware = htons(RTE_ARP_HRD_ETHER);
+    arp->arp_protocol = htons(RTE_ETHER_TYPE_IPV4);
+    arp->arp_hlen = RTE_ETHER_ADDR_LEN;
+    arp->arp_plen = sizeof(uint32_t);
+    arp->arp_opcode = htons(RTE_ARP_OP_REQUEST);
+    rte_ether_addr_copy(&g_bras.lan_mac, &arp->arp_data.arp_sha);
+    arp->arp_data.arp_sip = htonl(g_bras.nat_public_ip);
+    memset(&arp->arp_data.arp_tha, 0, RTE_ETHER_ADDR_LEN);
+    arp->arp_data.arp_tip = htonl(g_bras.nat_public_ip);
+
+    send_pkt(LAN_PORT, m);
+}
+
 /*
  * lan_icmp_echo_input — answer pings addressed to nat_public_ip.
  * Returns 0 when the packet was consumed (replied), -1 otherwise.
