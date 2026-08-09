@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+
 /* main.c — DPDK BRAS entry point
  *
  * Usage:
@@ -21,6 +23,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <time.h>
 #include <getopt.h>
 #include <arpa/inet.h>
 #include <sys/time.h>
@@ -50,6 +53,99 @@ int g_no_lcp_echo;
 
 /* ppp.c owns the injection state; main only exposes the CLI switch. */
 int ncp_injection_configure(const char *spec);
+
+struct timestamp_cookie {
+    int fd;
+};
+
+static FILE *g_timestamp_log_stream;
+
+static int
+write_all(int fd, const char *buffer, size_t length)
+{
+    size_t written = 0;
+
+    while (written < length) {
+        ssize_t ret = write(fd, buffer + written, length - written);
+        if (ret > 0) {
+            written += (size_t)ret;
+            continue;
+        }
+        if (ret < 0 && errno == EINTR)
+            continue;
+        return -1;
+    }
+    return 0;
+}
+
+static ssize_t
+timestamp_cookie_write(void *cookie_ptr, const char *buffer, size_t length)
+{
+    struct timestamp_cookie *cookie = cookie_ptr;
+    struct timespec now;
+    struct tm local;
+    char prefix[32];
+
+    if (length == 0)
+        return 0;
+    if (clock_gettime(CLOCK_REALTIME, &now) != 0 ||
+        !localtime_r(&now.tv_sec, &local))
+        return -1;
+
+    int prefix_len = snprintf(prefix, sizeof(prefix),
+        "[%04d-%02d-%02d %02d:%02d:%02d.%03ld] ",
+        local.tm_year + 1900, local.tm_mon + 1, local.tm_mday,
+        local.tm_hour, local.tm_min, local.tm_sec,
+        now.tv_nsec / 1000000);
+    if (prefix_len < 0 || (size_t)prefix_len >= sizeof(prefix)) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    if (write_all(cookie->fd, prefix, (size_t)prefix_len) != 0 ||
+        write_all(cookie->fd, buffer, length) != 0)
+        return -1;
+    return (ssize_t)length;
+}
+
+static int
+timestamp_cookie_close(void *cookie_ptr)
+{
+    struct timestamp_cookie *cookie = cookie_ptr;
+    int ret = close(cookie->fd);
+    free(cookie);
+    return ret;
+}
+
+static int
+timestamp_log_init(void)
+{
+    struct timestamp_cookie *cookie = calloc(1, sizeof(*cookie));
+    if (!cookie)
+        return -1;
+    cookie->fd = dup(STDERR_FILENO);
+    if (cookie->fd < 0) {
+        free(cookie);
+        return -1;
+    }
+
+    cookie_io_functions_t io = {
+        .write = timestamp_cookie_write,
+        .close = timestamp_cookie_close,
+    };
+    FILE *stream = fopencookie(cookie, "w", io);
+    if (!stream) {
+        close(cookie->fd);
+        free(cookie);
+        return -1;
+    }
+    if (setvbuf(stream, NULL, _IOLBF, 0) != 0 ||
+        rte_openlog_stream(stream) != 0) {
+        fclose(stream);
+        return -1;
+    }
+    g_timestamp_log_stream = stream;
+    return 0;
+}
 
 enum {
     OPT_PD_POOL = 256,
@@ -292,8 +388,6 @@ port_reinit(uint16_t port)
                                 g_bras.cfg_n_rxq, g_bras.cfg_n_txq, 0, 1);
 }
 
-#define PORT_REINIT_ATTEMPTS       30
-#define PORT_REINIT_DELAY_US       300000
 #define PARK_WARN_INTERVAL_SEC     2
 
 static uint8_t
@@ -309,8 +403,36 @@ parked_lcore_count(void)
     return count;
 }
 
-/* Main-lcore supervisor: atomically claims pending reset events, parks every
- * lcore that may touch ethdev, then rebuilds all affected ports in one pause. */
+/* Polling link state is data-plane safe and deliberately happens before the
+ * park request, so a slow PF does not lengthen the quiesced interval. */
+static int
+wait_reset_ports_ready(const uint8_t pending[2])
+{
+    uint64_t deadline = rte_rdtsc() +
+        rte_get_timer_hz() * PORT_READY_WAIT_MS / 1000;
+
+    while (g_running) {
+        int all_up = 1;
+        for (uint16_t port = WAN_PORT; port <= LAN_PORT; port++) {
+            if (!pending[port])
+                continue;
+            struct rte_eth_link link;
+            memset(&link, 0, sizeof(link));
+            if (rte_eth_link_get_nowait(port, &link) != 0 ||
+                link.link_status != RTE_ETH_LINK_UP)
+                all_up = 0;
+        }
+        if (all_up)
+            return 1;
+        if (rte_rdtsc() >= deadline)
+            return 0;
+        usleep(PORT_READY_POLL_MS * 1000);
+    }
+    return -1;
+}
+
+/* Main-lcore supervisor: claim reset events, wait for link without pausing,
+ * then park every ethdev user before rebuilding all affected ports. */
 static void
 recover_reset_ports(void)
 {
@@ -325,6 +447,17 @@ recover_reset_ports(void)
     if (!any_pending)
         return;
 
+    RTE_LOG(INFO, MAIN,
+            "waiting up to %u ms for reset ports link up\n",
+            PORT_READY_WAIT_MS);
+    int ready = wait_reset_ports_ready(pending);
+    if (ready < 0)
+        return;
+    if (!ready)
+        RTE_LOG(WARNING, MAIN,
+                "reset ports link wait timed out; rebuilding anyway\n");
+
+    RTE_LOG(INFO, MAIN, "VF reset recovery parking datapath\n");
     __atomic_store_n(&g_bras.dp_pause, 1, __ATOMIC_RELEASE);
     uint64_t warn_at = rte_rdtsc() +
         rte_get_timer_hz() * PARK_WARN_INTERVAL_SEC;
@@ -360,6 +493,8 @@ recover_reset_ports(void)
                 RTE_LOG(INFO, MAIN,
                         "port %u recovered after VF reset\n", port);
                 __atomic_store_n(&g_bras.nd6_backoff_reset, 1,
+                                 __ATOMIC_RELEASE);
+                __atomic_store_n(&g_bras.warmup_pending, 1,
                                  __ATOMIC_RELEASE);
                 break;
             }
@@ -757,6 +892,12 @@ int
 main(int argc, char *argv[])
 {
     int ret;
+
+    if (timestamp_log_init() != 0) {
+        fprintf(stderr, "cannot initialize timestamped log stream: %s\n",
+                strerror(errno));
+        return 1;
+    }
 
     /* ── EAL init ────────────────────────────────────────────────────── */
     ret = rte_eal_init(argc, argv);
@@ -1163,15 +1304,19 @@ main(int argc, char *argv[])
         if (++supervisor_ticks < 10)
             continue;
         supervisor_ticks = 0;
-        printf("[BRAS] sessions_up=%-4lu  rx=%-10lu  tx=%-10lu  drop=%-6lu",
-               g_bras.stat_sessions_up,
-               g_bras.stat_pkts_rx,
-               g_bras.stat_pkts_tx,
-               g_bras.stat_pkts_dropped);
+        flockfile(g_timestamp_log_stream);
+        fprintf(g_timestamp_log_stream,
+                "[BRAS] sessions_up=%-4lu  rx=%-10lu  tx=%-10lu  drop=%-6lu",
+                g_bras.stat_sessions_up,
+                g_bras.stat_pkts_rx,
+                g_bras.stat_pkts_tx,
+                g_bras.stat_pkts_dropped);
         for (uint16_t i = 0; i < g_bras.n_workers; i++)
-            printf("  w%u=%lu", i, g_bras.stat_worker_pkts[i]);
-        printf("\n");
-        fflush(stdout);
+            fprintf(g_timestamp_log_stream, "  w%u=%lu", i,
+                    g_bras.stat_worker_pkts[i]);
+        fputc('\n', g_timestamp_log_stream);
+        funlockfile(g_timestamp_log_stream);
+        fflush(g_timestamp_log_stream);
     }
 
     /* g_running is now 0 (set by sig_handler). Wait for worker lcores to

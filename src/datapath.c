@@ -620,6 +620,12 @@ ctrl_plane_lcore(void *arg __rte_unused)
         if (!g_running)
             break;
 
+        if (__atomic_exchange_n(&g_bras.warmup_pending, 0,
+                                __ATOMIC_ACQ_REL)) {
+            arp_announce_local();
+            nd6_announce_local();
+        }
+
         if (__atomic_exchange_n(&g_bras.nd6_backoff_reset, 0,
                                 __ATOMIC_ACQ_REL)) {
             nd6_attempts = 0;
