@@ -150,6 +150,11 @@ arp_announce_local(void)
     arp->arp_data.arp_tip = htonl(g_bras.nat_public_ip);
 
     send_pkt(LAN_PORT, m);
+    RTE_LOG(INFO, ARP, "gratuitous ARP sent for %u.%u.%u.%u on LAN port\n",
+            (g_bras.nat_public_ip >> 24) & 0xFF,
+            (g_bras.nat_public_ip >> 16) & 0xFF,
+            (g_bras.nat_public_ip >>  8) & 0xFF,
+            (g_bras.nat_public_ip      ) & 0xFF);
 }
 
 /*

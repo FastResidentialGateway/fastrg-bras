@@ -367,8 +367,9 @@ port_configure_start(uint16_t port, struct rte_mempool *pool,
         rte_eth_macaddr_get(port, &g_bras.lan_mac);
 
     RTE_LOG(INFO, MAIN,
-            "Port %u: %u RX / %u TX queue(s), MAC: "RTE_ETHER_ADDR_PRT_FMT"\n",
-            port, n_rxq, n_txq,
+            "Port %u: driver %s, %u RX / %u TX queue(s), "
+            "MAC: "RTE_ETHER_ADDR_PRT_FMT"\n",
+            port, dev_info.driver_name, n_rxq, n_txq,
             RTE_ETHER_ADDR_BYTES(port == WAN_PORT ? &g_bras.wan_mac
                                                   : &g_bras.lan_mac));
     return 0;
@@ -432,7 +433,9 @@ wait_reset_ports_ready(const uint8_t pending[2])
 }
 
 /* Main-lcore supervisor: claim reset events, wait for link without pausing,
- * then park every ethdev user before rebuilding all affected ports. */
+ * then park every ethdev user for one rebuild attempt per affected port.
+ * A failed port stays pending and is retried by the next supervisor tick,
+ * so no PMD timeout is ever served from inside the parked window. */
 static void
 recover_reset_ports(void)
 {
@@ -479,33 +482,32 @@ recover_reset_ports(void)
         if (!pending[port])
             continue;
 
-        int ret = rte_eth_dev_stop(port);
-        if (ret != 0)
-            RTE_LOG(WARNING, MAIN, "rte_eth_dev_stop(%u): %s\n",
+        /* rte_eth_dev_reset() is the ethdev answer to an INTR_RESET event:
+         * it stops the port and reruns the PMD uninit/init pair, which is
+         * what rebuilds VF-internal state (mailbox/adminq, reset flag, the
+         * resources the PF re-grants). A plain stop leaves that state stale
+         * and every later virtchnl command fails. PMDs without the op
+         * (af_packet) only need the stop. */
+        int ret = rte_eth_dev_reset(port);
+        if (ret == -ENOTSUP) {
+            ret = rte_eth_dev_stop(port);
+            if (ret != 0)
+                RTE_LOG(WARNING, MAIN, "rte_eth_dev_stop(%u): %s\n",
+                        port, strerror(-ret));
+            ret = 0;
+        } else if (ret != 0) {
+            RTE_LOG(ERR, MAIN, "rte_eth_dev_reset(%u): %s\n",
                     port, strerror(-ret));
-
-        int recovered = 0;
-        for (unsigned int attempt = 1;
-             attempt <= PORT_REINIT_ATTEMPTS && g_running; attempt++) {
-            ret = port_reinit(port);
-            if (ret == 0) {
-                recovered = 1;
-                RTE_LOG(INFO, MAIN,
-                        "port %u recovered after VF reset\n", port);
-                __atomic_store_n(&g_bras.nd6_backoff_reset, 1,
-                                 __ATOMIC_RELEASE);
-                __atomic_store_n(&g_bras.warmup_pending, 1,
-                                 __ATOMIC_RELEASE);
-                break;
-            }
-
-            if (attempt < PORT_REINIT_ATTEMPTS) {
-                usleep(PORT_REINIT_DELAY_US);
-                rte_eth_dev_stop(port);
-            }
         }
 
-        if (!recovered && g_running) {
+        if (ret == 0)
+            ret = port_reinit(port);
+
+        if (ret == 0) {
+            RTE_LOG(INFO, MAIN, "port %u recovered after VF reset\n", port);
+            __atomic_store_n(&g_bras.nd6_backoff_reset, 1, __ATOMIC_RELEASE);
+            __atomic_store_n(&g_bras.warmup_pending, 1, __ATOMIC_RELEASE);
+        } else {
             RTE_LOG(ERR, MAIN,
                     "port %u recovery degraded after VF reset; will retry\n",
                     port);
@@ -516,6 +518,7 @@ recover_reset_ports(void)
 
 resume_datapath:
     __atomic_store_n(&g_bras.dp_pause, 0, __ATOMIC_RELEASE);
+    RTE_LOG(INFO, MAIN, "VF reset recovery resumed datapath\n");
 }
 
 /* ── utility implementations ─────────────────────────────────────────── */

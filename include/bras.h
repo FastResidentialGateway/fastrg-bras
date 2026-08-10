@@ -47,8 +47,6 @@
 #define ND6_REQ_SLOW_INTERVAL_SEC   10
 #define PORT_READY_POLL_MS          100
 #define PORT_READY_WAIT_MS          10000
-#define PORT_REINIT_ATTEMPTS        5
-#define PORT_REINIT_DELAY_US        200000
 
 /* =====================================================================
  * PPPoE Protocol Constants  (RFC 2516)
