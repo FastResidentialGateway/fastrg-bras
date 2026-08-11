@@ -503,6 +503,11 @@ nd6_announce_local(void)
     icmp6_checksum(ip6, &na->icmp);
 
     send_pkt(LAN_PORT, m);
+
+    char address[INET6_ADDRSTRLEN];
+    if (!inet_ntop(AF_INET6, g_bras.lan_ip6, address, sizeof(address)))
+        strcpy(address, "<invalid>");
+    RTE_LOG(INFO, IPV6, "unsolicited NA sent for %s on LAN port\n", address);
 }
 
 static void
