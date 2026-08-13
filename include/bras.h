@@ -356,6 +356,14 @@ struct bras_ctx {
     struct rte_ether_addr lan_alias_mac;
     uint8_t               lan_alias_mac_set;
 
+    /* Solicited-node multicast MACs of lan_ip6 / lan_ip6_ll (identical when
+     * both end in the same three bytes, hence the count).  Upstream NDP sends
+     * its neighbour solicitations there, and a VF drops multicast it was not
+     * told to receive, so the LAN port has to subscribe to them explicitly.
+     * Empty until ipv6_addr_init() fills it. */
+    struct rte_ether_addr lan_mc_addrs[2];
+    uint32_t              lan_mc_count;
+
     /* NAT tables (internet-bound flows only — see struct nat_entry) */
     struct rte_hash    *nat_out_tbl;   /* (inner_ip, inner_port, proto) → outer_port */
     struct rte_hash    *nat_in_tbl;    /* (outer_port, proto) → entry */
@@ -522,7 +530,8 @@ int  lan_icmp_echo_input(struct rte_mbuf *mbuf); /* 0 = consumed */
 
 /* ipv6.c — callers/lcores are documented at each implementation. */
 void ipv6_mac_to_ifid(const struct rte_ether_addr *mac, uint8_t ifid[8]);
-void ipv6_addr_init(void);                         /* main lcore, after ports */
+void ipv6_addr_init(void);                         /* main lcore, after ports;
+                                                    * also fills lan_mc_addrs */
 int  ipv6_lan_input(struct rte_mbuf *mbuf);        /* RX lcore; 0 = consumed */
 int  ipv6_route_outbound(struct rte_mbuf *mbuf,
                          struct bras_session *sess); /* data worker */

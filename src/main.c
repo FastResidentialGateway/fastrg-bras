@@ -210,6 +210,54 @@ restore_vlan_filters(uint16_t port, int strict)
     return 0;
 }
 
+/* Let the LAN port receive the solicited-node multicast frames upstream NDP
+ * uses to resolve us: a VF drops multicast it never subscribed to, so without
+ * this the neighbour solicitations never reach the NS responder and upstream
+ * IPv6 stops as soon as its neighbour entry ages out.  Exact filtering first,
+ * allmulticast as the fallback for PMDs that lack it.  strict fails the caller
+ * so a port that came back deaf to IPv6 is retried rather than kept.
+ *
+ * The list is empty until ipv6_addr_init() has run, and that needs the MAC the
+ * first port start reads — so on the first start this is a no-op and main()
+ * subscribes right after that init; every later VF restart re-subscribes here.
+ */
+static int
+lan_mc_subscribe(uint16_t port, int strict)
+{
+    if (port != LAN_PORT || g_bras.lan_mc_count == 0)
+        return 0;
+
+    int ret = rte_eth_dev_set_mc_addr_list(port, g_bras.lan_mc_addrs,
+                                           g_bras.lan_mc_count);
+    if (ret == 0) {
+        RTE_LOG(INFO, MAIN,
+                "LAN port subscribed %u solicited-node multicast MAC(s)\n",
+                g_bras.lan_mc_count);
+        return 0;
+    }
+    RTE_LOG(WARNING, MAIN,
+            "rte_eth_dev_set_mc_addr_list(LAN) failed: %s — "
+            "falling back to allmulticast\n", strerror(-ret));
+
+    ret = rte_eth_allmulticast_enable(port);
+    if (ret == 0) {
+        RTE_LOG(INFO, MAIN, "LAN port allmulticast enabled\n");
+        return 0;
+    }
+    if (strict) {
+        RTE_LOG(ERR, MAIN,
+                "rte_eth_allmulticast_enable(LAN) failed: %s — upstream "
+                "neighbour solicitations are dropped, IPv6 breaks\n",
+                strerror(-ret));
+        return ret;
+    }
+    RTE_LOG(WARNING, MAIN,
+            "rte_eth_allmulticast_enable(LAN) failed: %s — upstream "
+            "neighbour solicitations are dropped, IPv6 breaks\n",
+            strerror(-ret));
+    return 0;
+}
+
 static int
 restore_post_start(uint16_t port, int strict)
 {
@@ -237,6 +285,10 @@ restore_post_start(uint16_t port, int strict)
                     strerror(-ret));
         }
     }
+
+    ret = lan_mc_subscribe(port, strict);
+    if (ret != 0)
+        return ret;
 
     return restore_vlan_filters(port, strict);
 }
@@ -1191,6 +1243,9 @@ main(int argc, char *argv[])
     if (port_init(WAN_PORT, g_bras.pktmbuf_pool, n_rxq, n_txq) != 0) return 1;
     if (port_init(LAN_PORT, g_bras.pktmbuf_pool, n_rxq, n_txq) != 0) return 1;
     ipv6_addr_init();
+    /* First subscription: only now does the multicast list exist.  A failure
+     * is logged inside and must not stop the BRAS — IPv4 keeps working. */
+    lan_mc_subscribe(LAN_PORT, 0);
 
     /* Enable runtime full-traffic capture: with this, dpdk-dumpcap can be
      * attached on demand (e.g. `dpdk-dumpcap -i 0 -w /tmp/all.pcapng`)
