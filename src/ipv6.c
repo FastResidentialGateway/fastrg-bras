@@ -103,7 +103,22 @@ ipv6_mac_to_ifid(const struct rte_ether_addr *mac, uint8_t ifid[8])
     ifid[7] = m[5];
 }
 
-/* Called by the main lcore after both port MAC addresses are known. */
+/* Ethernet mapping of an address' solicited-node multicast group: 33:33:ff
+ * followed by the last three bytes of the address (RFC 2464). */
+static void
+solicited_node_mac(const uint8_t address[16], struct rte_ether_addr *mac)
+{
+    mac->addr_bytes[0] = 0x33;
+    mac->addr_bytes[1] = 0x33;
+    mac->addr_bytes[2] = 0xff;
+    mac->addr_bytes[3] = address[13];
+    mac->addr_bytes[4] = address[14];
+    mac->addr_bytes[5] = address[15];
+}
+
+/* Called by the main lcore after both port MAC addresses are known: derives
+ * the link-local addresses plus the multicast MACs the LAN port has to
+ * subscribe to. */
 void
 ipv6_addr_init(void)
 {
@@ -120,6 +135,15 @@ ipv6_addr_init(void)
     g_bras.wan_ll[1] = 0x80;
     ipv6_mac_to_ifid(&g_bras.wan_mac, ifid);
     memcpy(g_bras.wan_ll + 8, ifid, sizeof(ifid));
+
+    /* The two addresses upstream neighbours solicit us on.  Both map to the
+     * same multicast MAC when lan_ip6 ends in the same three bytes as lan_mac,
+     * so drop the duplicate. */
+    solicited_node_mac(g_bras.lan_ip6, &g_bras.lan_mc_addrs[0]);
+    solicited_node_mac(g_bras.lan_ip6_ll, &g_bras.lan_mc_addrs[1]);
+    g_bras.lan_mc_count = rte_is_same_ether_addr(&g_bras.lan_mc_addrs[0],
+                                                 &g_bras.lan_mc_addrs[1])
+                          ? 1 : 2;
 }
 
 static void
