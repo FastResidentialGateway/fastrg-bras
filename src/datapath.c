@@ -776,7 +776,7 @@ ctrl_plane_lcore(void *arg __rte_unused)
             RTE_LOG(INFO, DP,
                     "stats: sessions_up=%lu rx=%lu tx=%lu drop=%lu "
                     "(txfull=%lu dist=%lu route=%lu vlan=%lu) w0=%lu w1=%lu\n",
-                    g_bras.stat_sessions_up,
+                    count_sessions_up(),
                     g_bras.stat_pkts_rx,
                     g_bras.stat_pkts_tx,
                     g_bras.stat_pkts_dropped,

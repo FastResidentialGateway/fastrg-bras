@@ -4,10 +4,10 @@ A minimal DPDK-based BRAS implementing:
 - **PPPoE** Discovery (PADI/PADO/PADR/PADS/PADT) — RFC 2516
 - **LCP** negotiation (MRU, auth method, magic number)
 - **CHAP** authentication (MD5 challenge/response — accept-all for lab)
-- **IPCP** address assignment from a /30 pool per session
+- **IPCP** address assignment from a client pool; addresses are reused after a session ends
 - **IPCP DNS push** — primary/secondary DNS via options 129/131 (RFC 1877)
 - **IPv6CP** interface-identifier negotiation (RFC 5072)
-- **DHCPv6-PD** deterministic /56 delegation with recursive DNS (RFC 8415)
+- **DHCPv6-PD** /56 delegation from a pool with recursive DNS (RFC 8415)
 - **IPv6 routing** PPP 0x0057 decapsulation/encapsulation with /56 anti-spoofing
 - **NDP/ICMPv6** upstream next-hop discovery and local echo replies
 - **VF reset recovery** parked-lcore port rebuild after PF reset events
@@ -43,11 +43,12 @@ NIC connected to dpdk-bras's WAN port. The BRAS will:
 1. Respond to PADI with PADO (AC-Name: `dpdk-bras`)
 2. Assign session ID in PADS
 3. Negotiate LCP with CHAP (or PAP)
-4. Assign client IP from `10.64.0.0/30` pool:
-   - Session 1 → server `10.64.0.1`, client `10.64.0.2`
-   - Session 2 → server `10.64.0.5`, client `10.64.0.6`
-   - Session N → server `10.64.0.(N-1)*4+1`, client `+1`
-5. Delegate a deterministic IPv6 /56 after IPv6CP opens
+4. Assign the lowest free client IP in `--ip-pool`..`--ip-pool-end`
+   (default `192.168.200.130`..`192.168.200.254`); the server side is always
+   `--local-ip` (default `192.168.200.128`). The address returns to the pool
+   when the session ends.
+5. Delegate the lowest free IPv6 /56 of `--pd-pool` after IPv6CP opens; it
+   also returns to the pool when the session ends
 6. Route delegated IPv6 prefixes between PPPoE and the upstream LAN
 7. Route client IPv4 data to upstream server via SNAT
 
@@ -191,8 +192,8 @@ push them — only options the client asks for are negotiated.
 ## DHCPv6 Prefix Delegation
 
 After IPv6CP opens, the BRAS answers DHCPv6 Solicit, Request, Renew, Rebind,
-and Release messages over PPP. Each session receives a deterministic /56 from
-the configured pool. The node uses the delegated /56's first /64 for its LAN.
+and Release messages over PPP. Each session receives the lowest free /56 of
+the configured pool and keeps it until the session ends. The node uses the delegated /56's first /64 for its LAN.
 The Reply also carries both configured IPv6 DNS servers.
 
 | option | default | description |

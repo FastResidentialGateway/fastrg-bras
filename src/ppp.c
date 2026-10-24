@@ -428,7 +428,7 @@ chap_send_result(struct bras_session *sess, int success)
 void
 ipcp_send_conf_req(struct bras_session *sess)
 {
-    /* Our PPP endpoint is fixed; client gets one IP from the linear pool */
+    /* Our PPP endpoint is fixed; the client keeps one pool IP per session */
     sess->server_ip = g_bras.ppp_local_ip;
     if (sess->client_ip == 0)
         sess->client_ip = session_alloc_ip(sess->session_id);
@@ -1113,7 +1113,6 @@ ppp_handle_ctrl(struct rte_mbuf *mbuf, uint16_t session_id)
                 ncp_stopped[session_id] = 0;
             }
             sess->state = SESS_UP;
-            g_bras.stat_sessions_up++;
             break;
         case LCP_TERM_REQ:
             RTE_LOG(INFO, PPP, "[%u] IPCP TERM_REQ from client\n", session_id);

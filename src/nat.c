@@ -442,9 +442,12 @@ route_inbound(struct rte_mbuf *mbuf)
         if (!sess)
             return -1;
     } else if (dst >= g_bras.ip_pool_start && dst <= g_bras.ip_pool_end) {
-        /* Session N owns ip_pool_start + (N-1) — see session_alloc_ip() */
-        uint16_t session_id = (uint16_t)(dst - g_bras.ip_pool_start) + 1;
-        if (session_id == 0 || session_id > MAX_SESSIONS)
+        /* ip_owner maps the address to its session — see session_alloc_ip() */
+        uint32_t slot = dst - g_bras.ip_pool_start;
+        if (slot >= g_bras.ip_pool_size)
+            return -1;
+        uint16_t session_id = g_bras.ip_owner[slot];
+        if (session_id == 0)
             return -1;
         sess = &g_bras.sessions[session_id];
         if (sess->state != SESS_UP || sess->client_ip != dst)

@@ -257,6 +257,7 @@ struct bras_session {
     uint8_t             pd_prefix[8];
     uint8_t             pd_active;
     uint32_t            pd_iaid;
+    uint16_t            pd_index;      /* slot in g_bras.pd_owner, 0 = none */
 
     /* Assigned addressing */
     uint32_t            client_ip;     /* IP we assign to client */
@@ -334,6 +335,12 @@ struct bras_ctx {
     uint32_t            ppp_local_ip;  /* our PPP endpoint, e.g. 192.168.200.128 */
     uint32_t            ip_pool_start; /* first client IP, e.g. 192.168.200.130 */
     uint32_t            ip_pool_end;   /* last  client IP, e.g. 192.168.200.254 */
+    uint32_t            ip_pool_size;  /* addresses handed out, at most
+                                        * MAX_SESSIONS                     */
+    /* ip_owner[i] is the session holding ip_pool_start + i, 0 = free.
+     * Only the ctrl lcore writes it; data lcores read it to find the
+     * session an inbound packet belongs to. */
+    uint16_t            ip_owner[MAX_SESSIONS];
 
     /* LAN-side addressing: our LAN IP (ARP/ICMP responder) + next-hop */
     uint32_t            nat_public_ip; /* our IP on the LAN net (gateway for
@@ -376,6 +383,11 @@ struct bras_ctx {
     /* DHCPv6 delegated-prefix pool and DNS servers. */
     uint8_t             pd_pool_prefix[8];
     uint8_t             pd_pool_plen;
+    /* pd_owner[i] is the session holding the i-th /56 of the pool, 0 = free;
+     * slots 1..pd_pool_slots-1 are handed out.  Same writer/reader split as
+     * ip_owner. */
+    uint16_t            pd_owner[MAX_SESSIONS + 1];
+    uint32_t            pd_pool_slots;
     uint8_t             dns6_pri[16];
     uint8_t             dns6_sec[16];
 
@@ -416,7 +428,6 @@ struct bras_ctx {
     uint8_t             vlan_filter_enabled;
 
     /* Statistics */
-    uint64_t            stat_sessions_up;
     uint64_t            stat_pkts_rx;
     uint64_t            stat_pkts_tx;
     uint64_t            stat_pkts_dropped;
@@ -550,5 +561,7 @@ void             drop_capture(struct rte_mbuf *mbuf, uint16_t port,
 uint16_t         alloc_session_id(void);
 void             free_session(uint16_t session_id);
 uint32_t         session_alloc_ip(uint16_t session_id);
+uint16_t         session_alloc_pd(uint16_t session_id);
+uint64_t         count_sessions_up(void);
 
 #endif /* BRAS_H */

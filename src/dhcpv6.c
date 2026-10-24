@@ -1,8 +1,8 @@
 /* dhcpv6.c — DHCPv6 prefix-delegation server over PPP IPv6
  *
  * Packets are handled on LCORE_CTRL after IPv6CP opens.  The server keeps no
- * persistent lease database: each session ID maps deterministically to one
- * /56 in the configured pool.
+ * persistent lease database: a session takes the lowest free /56 of the
+ * configured pool on its first Solicit and holds it until the session ends.
  */
 
 #include <string.h>
@@ -170,18 +170,15 @@ append_option(uint8_t **cursor, const uint8_t *end, uint16_t code,
 static int
 delegated_prefix(struct bras_session *sess, uint8_t prefix[16])
 {
-    if (g_bras.pd_pool_plen == 0 || g_bras.pd_pool_plen > 55)
-        return -1;
-
-    uint64_t capacity = UINT64_C(1) <<
-        (DHCPV6_PD_PLEN - g_bras.pd_pool_plen);
-    if ((uint64_t)sess->session_id >= capacity)
+    if (sess->pd_index == 0)
+        sess->pd_index = session_alloc_pd(sess->session_id);
+    if (sess->pd_index == 0)
         return -1;
 
     uint64_t high = 0;
     for (unsigned int i = 0; i < sizeof(g_bras.pd_pool_prefix); i++)
         high = (high << 8) | g_bras.pd_pool_prefix[i];
-    high += (uint64_t)sess->session_id << 8;
+    high += (uint64_t)sess->pd_index << 8;
 
     memset(prefix, 0, 16);
     for (int i = 7; i >= 0; i--) {
