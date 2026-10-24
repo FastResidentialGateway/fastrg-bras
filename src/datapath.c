@@ -44,9 +44,27 @@ drop_pkt(struct rte_mbuf *m, const char *reason)
     rte_pktmbuf_free(m);
 }
 
+/* Called only at lcore-specific safe points where no mbuf is owned and the
+ * next operation would touch ethdev. Each lcore writes only its own slot. */
+static inline void
+park_current_lcore(void)
+{
+    if (!__atomic_load_n(&g_bras.dp_pause, __ATOMIC_ACQUIRE))
+        return;
+
+    unsigned int me = rte_lcore_id();
+    __atomic_store_n(&g_bras.dp_ack[me], 1, __ATOMIC_RELEASE);
+    while (g_running &&
+           __atomic_load_n(&g_bras.dp_pause, __ATOMIC_ACQUIRE))
+        rte_pause();
+    __atomic_store_n(&g_bras.dp_ack[me], 0, __ATOMIC_RELEASE);
+}
+
 /*
- * Decide if a PPPoE session frame contains PPP control traffic
- * (LCP, IPCP, CHAP, PAP) or IP data (0x0021).
+ * Decide if a PPPoE session frame belongs on the control lcore.  IPv4 is
+ * always data.  IPv6 is data unless its destination is multicast or the
+ * BRAS WAN link-local address; short/malformed IPv6 is sent to ctrl so the
+ * normal validation path can discard it safely.
  */
 static inline int
 is_ppp_ctrl(struct rte_mbuf *mbuf)
@@ -55,10 +73,54 @@ is_ppp_ctrl(struct rte_mbuf *mbuf)
     uint16_t l2_len, vlan_tci;
     bras_frame_ethertype(p, &l2_len, &vlan_tci);
     (void)vlan_tci;
-    struct ppp_hdr *pph = (struct ppp_hdr *)
-        (p + l2_len + sizeof(struct pppoe_hdr));
+    uint16_t ppp_off = l2_len + sizeof(struct pppoe_hdr);
+    if (rte_pktmbuf_pkt_len(mbuf) < ppp_off + sizeof(struct ppp_hdr))
+        return 1;
+    struct ppp_hdr *pph = (struct ppp_hdr *)(p + ppp_off);
     uint16_t proto = ntohs(pph->protocol);
-    return (proto != PPP_IP);
+    if (proto == PPP_IP)
+        return 0;
+    if (proto != PPP_IPV6)
+        return 1;
+
+    uint16_t ip_off = ppp_off + sizeof(*pph);
+    if (rte_pktmbuf_pkt_len(mbuf) < ip_off + sizeof(struct rte_ipv6_hdr))
+        return 1;
+    const struct rte_ipv6_hdr *ip6 =
+        (const struct rte_ipv6_hdr *)(p + ip_off);
+    const uint8_t *dst = (const uint8_t *)&ip6->dst_addr;
+    if (rte_ipv6_check_version(ip6) != 0)
+        return 1;
+    return dst[0] == 0xff || memcmp(dst, g_bras.wan_ll, 16) == 0;
+}
+
+static inline uint16_t
+ppp_protocol(struct rte_mbuf *mbuf, uint16_t l2_len)
+{
+    uint8_t *p = rte_pktmbuf_mtod(mbuf, uint8_t *);
+    const struct ppp_hdr *pph = (const struct ppp_hdr *)
+        (p + l2_len + sizeof(struct pppoe_hdr));
+    return ntohs(pph->protocol);
+}
+
+static inline int
+ipv6_in_pd_pool(const struct rte_ipv6_hdr *ip6)
+{
+    const uint8_t *dst = (const uint8_t *)&ip6->dst_addr;
+    uint8_t plen = g_bras.pd_pool_plen;
+    unsigned int bytes = plen / 8;
+    unsigned int bits = plen % 8;
+
+    if (plen == 0 || plen > 64 ||
+        (bytes > 0 && memcmp(dst, g_bras.pd_pool_prefix, bytes) != 0))
+        return 0;
+    if (bits != 0) {
+        uint8_t mask = (uint8_t)(0xffu << (8 - bits));
+        if ((dst[bytes] & mask) !=
+            (g_bras.pd_pool_prefix[bytes] & mask))
+            return 0;
+    }
+    return 1;
 }
 
 /*
@@ -128,7 +190,10 @@ process_wan_burst(struct rte_mbuf **pkts, uint16_t nb)
 
             /* ── Data packet on established session ── */
             struct bras_session *sess = &g_bras.sessions[sid];
-            if (route_outbound(m, sess) == 0) {
+            uint16_t proto = ppp_protocol(m, l2_len);
+            int routed = proto == PPP_IPV6 ?
+                ipv6_route_outbound(m, sess) : route_outbound(m, sess);
+            if (routed == 0) {
                 send_pkt(LAN_PORT, m);
                 g_bras.stat_pkts_tx++;
             } else {
@@ -159,6 +224,24 @@ process_lan_burst(struct rte_mbuf **pkts, uint16_t nb)
         /* ARP: answer requests for our SNAT IP / learn next-hop MAC */
         if (eth->ether_type == htons(RTE_ETHER_TYPE_ARP)) {
             arp_input(m);
+            continue;
+        }
+
+        if (eth->ether_type == htons(RTE_ETHER_TYPE_IPV6)) {
+            if (ipv6_lan_input(m) == 0)
+                continue;
+            struct rte_ipv6_hdr *ip6 =
+                (struct rte_ipv6_hdr *)(eth + 1);
+            if (ipv6_in_pd_pool(ip6) && ipv6_route_inbound(m) == 0) {
+                send_pkt(WAN_PORT, m);
+                g_bras.stat_pkts_tx++;
+            } else if (ipv6_in_pd_pool(ip6)) {
+                g_bras.stat_drop_route++;
+                drop_pkt(m, "drop:route");
+            } else {
+                g_bras.stat_drop_other++;
+                drop_pkt(m, "drop:other");
+            }
             continue;
         }
 
@@ -206,6 +289,30 @@ flow_tag(const uint8_t *ip_start)
     return rte_hash_crc_4byte(proto, tag);
 }
 
+/* IPv6 fixed-header flow hash.  Extension headers deliberately fall back
+ * to the address pair because this datapath does not parse their chain. */
+static inline uint32_t
+flow_tag6(const uint8_t *ip_start, uint16_t available)
+{
+    const struct rte_ipv6_hdr *ip6 =
+        (const struct rte_ipv6_hdr *)ip_start;
+    const uint8_t *addresses = (const uint8_t *)&ip6->src_addr;
+    uint32_t tag = 0;
+
+    for (unsigned int i = 0; i < 8; i++) {
+        uint32_t word;
+        memcpy(&word, addresses + i * sizeof(word), sizeof(word));
+        tag = rte_hash_crc_4byte(word, tag);
+    }
+
+    uint32_t ports = 0;
+    if ((ip6->proto == IPPROTO_TCP || ip6->proto == IPPROTO_UDP) &&
+        available >= sizeof(*ip6) + sizeof(ports))
+        memcpy(&ports, ip_start + sizeof(*ip6), sizeof(ports));
+    tag = rte_hash_crc_4byte(ports, tag);
+    return rte_hash_crc_4byte(ip6->proto, tag);
+}
+
 /*
  * Classify one WAN burst: control traffic to the ctrl ring (as in legacy
  * mode), session data tagged and appended to the distributor batch.
@@ -248,9 +355,13 @@ classify_wan_dist(struct rte_mbuf **pkts, uint16_t nb,
             }
 
             /* Data on an UP session → tag by the inner 5-tuple */
-            m->hash.usr = flow_tag(p + l2_len +
-                                   sizeof(struct pppoe_hdr) +
-                                   sizeof(struct ppp_hdr));
+            uint16_t ip_off = l2_len + sizeof(struct pppoe_hdr) +
+                              sizeof(struct ppp_hdr);
+            uint16_t proto = ppp_protocol(m, l2_len);
+            m->hash.usr = proto == PPP_IPV6 ?
+                flow_tag6(p + ip_off,
+                          (uint16_t)(rte_pktmbuf_pkt_len(m) - ip_off)) :
+                flow_tag(p + ip_off);
             batch[n_batch++] = m;
             continue;
         }
@@ -279,6 +390,28 @@ classify_lan_dist(struct rte_mbuf **pkts, uint16_t nb,
 
         if (eth->ether_type == htons(RTE_ETHER_TYPE_ARP)) {
             arp_input(m);
+            continue;
+        }
+
+        if (eth->ether_type == htons(RTE_ETHER_TYPE_IPV6)) {
+            if (ipv6_lan_input(m) == 0)
+                continue;
+            if (rte_pktmbuf_pkt_len(m) < sizeof(*eth) +
+                                             sizeof(struct rte_ipv6_hdr)) {
+                g_bras.stat_drop_other++;
+                drop_pkt(m, "drop:other");
+                continue;
+            }
+            struct rte_ipv6_hdr *ip6 =
+                (struct rte_ipv6_hdr *)(eth + 1);
+            if (!ipv6_in_pd_pool(ip6)) {
+                g_bras.stat_drop_other++;
+                drop_pkt(m, "drop:other");
+                continue;
+            }
+            m->hash.usr = flow_tag6((uint8_t *)ip6,
+                (uint16_t)(rte_pktmbuf_pkt_len(m) - sizeof(*eth)));
+            batch[n_batch++] = m;
             continue;
         }
 
@@ -317,6 +450,13 @@ rx_dist_lcore(void *arg __rte_unused)
             rte_lcore_id(), g_bras.n_workers);
 
     while (g_running) {
+        if (__atomic_load_n(&g_bras.dp_pause, __ATOMIC_ACQUIRE)) {
+            rte_distributor_process(dist, NULL, 0);
+            rte_distributor_returned_pkts(dist, ret, RTE_DIM(ret));
+            park_current_lcore();
+            continue;
+        }
+
         n_batch = 0;
         nb = rte_eth_rx_burst(WAN_PORT, 0, pkts, BURST_SIZE);
         if (nb > 0)
@@ -366,6 +506,8 @@ dist_worker_lcore(void *arg)
     while (g_running) {
         n = rte_distributor_poll_pkt(dist, wid, bufs);
         if (n < 0) {
+            if (__atomic_load_n(&g_bras.dp_pause, __ATOMIC_ACQUIRE))
+                park_current_lcore();
             rte_pause();
             continue;
         }
@@ -381,10 +523,15 @@ dist_worker_lcore(void *arg)
                 struct pppoe_hdr *ph = (struct pppoe_hdr *)(p + l2_len);
                 uint16_t sid = ntohs(ph->session_id);
                 struct bras_session *sess = &g_bras.sessions[sid];
+                uint16_t proto = ppp_protocol(m, l2_len);
 
                 /* Session may have been torn down while queued */
-                if (sess->state == SESS_UP &&
-                    route_outbound(m, sess) == 0) {
+                int routed = -1;
+                if (sess->state == SESS_UP)
+                    routed = proto == PPP_IPV6 ?
+                        ipv6_route_outbound(m, sess) :
+                        route_outbound(m, sess);
+                if (routed == 0) {
                     send_pkt(LAN_PORT, m);
                     g_bras.stat_pkts_tx++;
                 } else {
@@ -392,7 +539,11 @@ dist_worker_lcore(void *arg)
                     drop_pkt(m, "drop:route");
                 }
             } else {
-                if (route_inbound(m) == 0) {
+                struct rte_ether_hdr *eth =
+                    rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
+                int routed = eth->ether_type == htons(RTE_ETHER_TYPE_IPV6) ?
+                    ipv6_route_inbound(m) : route_inbound(m);
+                if (routed == 0) {
                     send_pkt(WAN_PORT, m);
                     g_bras.stat_pkts_tx++;
                 } else {
@@ -427,6 +578,10 @@ datapath_lcore(void *arg)
             rte_lcore_id(), queue_id);
 
     while (g_running) {
+        park_current_lcore();
+        if (!g_running)
+            break;
+
         /* WAN (client side) */
         nb = rte_eth_rx_burst(WAN_PORT, queue_id, wan_pkts, BURST_SIZE);
         if (nb > 0)
@@ -451,7 +606,9 @@ ctrl_plane_lcore(void *arg __rte_unused)
 {
     void *obj;
     uint64_t last_timer = rte_rdtsc();
-    uint64_t last_arp   = 0;
+    uint64_t last_neighbor_tick = 0;
+    uint64_t last_nd6   = 0;
+    uint32_t nd6_attempts = 0;
     const uint64_t timer_interval = rte_get_timer_hz() * 10; /* 10 sec */
     const uint64_t arp_interval   = rte_get_timer_hz();      /*  1 sec */
 
@@ -459,6 +616,22 @@ ctrl_plane_lcore(void *arg __rte_unused)
             rte_lcore_id());
 
     while (g_running) {
+        park_current_lcore();
+        if (!g_running)
+            break;
+
+        if (__atomic_exchange_n(&g_bras.warmup_pending, 0,
+                                __ATOMIC_ACQ_REL)) {
+            arp_announce_local();
+            nd6_announce_local();
+        }
+
+        if (__atomic_exchange_n(&g_bras.nd6_backoff_reset, 0,
+                                __ATOMIC_ACQ_REL)) {
+            nd6_attempts = 0;
+            last_nd6 = 0;
+        }
+
         if (g_terminate_sessions) {
             g_terminate_sessions = 0;
             for (int i = 1; i <= MAX_SESSIONS; i++) {
@@ -477,12 +650,29 @@ ctrl_plane_lcore(void *arg __rte_unused)
             }
         }
 
-        /* Resolve the upstream next-hop MAC before traffic can flow */
-        if (!g_bras.upstream_mac_valid) {
-            uint64_t t = rte_rdtsc();
-            if (t - last_arp >= arp_interval) {
-                last_arp = t;
-                arp_request_upstream();
+        /* Gate autonomous neighbour discovery on the cached LAN link state.
+         * ARP remains at 1 Hz; unresolved IPv6 backs off after 30 sends. */
+        uint64_t neighbour_now = rte_rdtsc();
+        if ((!g_bras.upstream_mac_valid || !g_bras.upstream_mac6_valid) &&
+            neighbour_now - last_neighbor_tick >= arp_interval) {
+            last_neighbor_tick = neighbour_now;
+            struct rte_eth_link link;
+            memset(&link, 0, sizeof(link));
+            if (rte_eth_link_get_nowait(LAN_PORT, &link) == 0 &&
+                link.link_status == RTE_ETH_LINK_UP) {
+                if (!g_bras.upstream_mac_valid)
+                    arp_request_upstream();
+
+                uint64_t nd6_interval = nd6_attempts <
+                    ND6_REQ_FAST_ATTEMPTS ? arp_interval :
+                    rte_get_timer_hz() * ND6_REQ_SLOW_INTERVAL_SEC;
+                if (!g_bras.upstream_mac6_valid &&
+                    (last_nd6 == 0 ||
+                     neighbour_now - last_nd6 >= nd6_interval)) {
+                    last_nd6 = neighbour_now;
+                    nd6_request_upstream();
+                    nd6_attempts++;
+                }
             }
         }
 
@@ -586,7 +776,7 @@ ctrl_plane_lcore(void *arg __rte_unused)
             RTE_LOG(INFO, DP,
                     "stats: sessions_up=%lu rx=%lu tx=%lu drop=%lu "
                     "(txfull=%lu dist=%lu route=%lu vlan=%lu) w0=%lu w1=%lu\n",
-                    g_bras.stat_sessions_up,
+                    count_sessions_up(),
                     g_bras.stat_pkts_rx,
                     g_bras.stat_pkts_tx,
                     g_bras.stat_pkts_dropped,

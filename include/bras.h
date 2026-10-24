@@ -41,8 +41,12 @@
 #define MAX_RX_QUEUES       8           /* max data-path lcores / queues per port */
 
 /* LCore assignment */
-#define LCORE_CTRL          2           /* control plane: PPPoE/LCP/IPCP */
+#define LCORE_CTRL          2           /* control plane: PPPoE/PPP/DHCPv6 */
 #define MAX_DIST_WORKERS    8           /* max distributor worker lcores */
+#define ND6_REQ_FAST_ATTEMPTS       30
+#define ND6_REQ_SLOW_INTERVAL_SEC   10
+#define PORT_READY_POLL_MS          100
+#define PORT_READY_WAIT_MS          10000
 
 /* =====================================================================
  * PPPoE Protocol Constants  (RFC 2516)
@@ -72,6 +76,17 @@
 #define PPP_IPCP            0x8021
 #define PPP_IPV6CP          0x8057
 #define PPP_IP              0x0021
+#define PPP_IPV6            0x0057
+
+/* ICMPv6 message and neighbour-discovery option types. */
+#define ICMPV6_ECHO_REQ      128
+#define ICMPV6_ECHO_REP      129
+#define ICMPV6_RS            133
+#define ICMPV6_RA            134
+#define ICMPV6_NS            135
+#define ICMPV6_NA            136
+#define ND6_OPT_SLL          1
+#define ND6_OPT_TLL          2
 
 /* LCP codes */
 #define LCP_CONF_REQ        1
@@ -104,6 +119,33 @@
  * Override at runtime via --pri-dns / --sec-dns command-line flags. */
 #define DEFAULT_PRI_DNS     RTE_IPV4(1, 1, 1, 1)
 #define DEFAULT_SEC_DNS     RTE_IPV4(8, 8, 8, 8)
+
+/* DHCPv6 message types, options, ports, and lease timers (RFC 8415). */
+#define DHCPV6_SOLICIT              1
+#define DHCPV6_ADVERTISE            2
+#define DHCPV6_REQUEST              3
+#define DHCPV6_RENEW                5
+#define DHCPV6_REBIND               6
+#define DHCPV6_REPLY                7
+#define DHCPV6_RELEASE              8
+
+#define DHCPV6_OPT_CLIENTID         1
+#define DHCPV6_OPT_SERVERID         2
+#define DHCPV6_OPT_ORO              6
+#define DHCPV6_OPT_STATUS           13
+#define DHCPV6_OPT_DNS_SERVERS      23
+#define DHCPV6_OPT_IA_PD            25
+#define DHCPV6_OPT_IAPREFIX         26
+
+#define DHCPV6_CLIENT_PORT          546
+#define DHCPV6_SERVER_PORT          547
+#define DHCPV6_STATUS_SUCCESS       0
+#define DHCPV6_STATUS_NO_PREFIX     6
+#define DHCPV6_PREFERRED_LIFETIME   43200
+#define DHCPV6_VALID_LIFETIME       86400
+#define DHCPV6_T1                   21600
+#define DHCPV6_T2                   34560
+#define DHCPV6_PD_PLEN              56
 
 /* CHAP codes */
 #define CHAP_CHALLENGE      1
@@ -210,6 +252,13 @@ struct bras_session {
     uint8_t             ipv6cp_attempts;
     uint64_t            ipv6cp_sent_at;
 
+    /* DHCPv6-PD lease: high 64 bits of the delegated /56.  Bits 56..63
+     * remain zero so the client can subnet the prefix into /64 LANs. */
+    uint8_t             pd_prefix[8];
+    uint8_t             pd_active;
+    uint32_t            pd_iaid;
+    uint16_t            pd_index;      /* slot in g_bras.pd_owner, 0 = none */
+
     /* Assigned addressing */
     uint32_t            client_ip;     /* IP we assign to client */
     uint32_t            server_ip;     /* our PPP endpoint IP   */
@@ -236,7 +285,7 @@ struct bras_session {
  * ===================================================================== */
 typedef enum {
     CTRL_MSG_PPPOE_DISC,    /* discovery packet (PADI/PADR/PADT) */
-    CTRL_MSG_PPP_CTRL,      /* LCP / IPCP / auth packet */
+    CTRL_MSG_PPP_CTRL,      /* PPP control or control-plane IPv6 packet */
 } ctrl_msg_type_t;
 
 struct ctrl_msg {
@@ -286,6 +335,12 @@ struct bras_ctx {
     uint32_t            ppp_local_ip;  /* our PPP endpoint, e.g. 192.168.200.128 */
     uint32_t            ip_pool_start; /* first client IP, e.g. 192.168.200.130 */
     uint32_t            ip_pool_end;   /* last  client IP, e.g. 192.168.200.254 */
+    uint32_t            ip_pool_size;  /* addresses handed out, at most
+                                        * MAX_SESSIONS                     */
+    /* ip_owner[i] is the session holding ip_pool_start + i, 0 = free.
+     * Only the ctrl lcore writes it; data lcores read it to find the
+     * session an inbound packet belongs to. */
+    uint16_t            ip_owner[MAX_SESSIONS];
 
     /* LAN-side addressing: our LAN IP (ARP/ICMP responder) + next-hop */
     uint32_t            nat_public_ip; /* our IP on the LAN net (gateway for
@@ -294,11 +349,27 @@ struct bras_ctx {
     struct rte_ether_addr upstream_mac;      /* learned via ARP */
     volatile uint8_t      upstream_mac_valid;
 
+    /* IPv6 upstream-side addressing and resolved next-hop. */
+    uint8_t             lan_ip6[16];       /* our LAN-side global address */
+    uint8_t             lan_ip6_ll[16];    /* fe80:: EUI-64(lan_mac)      */
+    uint8_t             upstream_ip6[16];  /* next-hop for v6 outbound    */
+    struct rte_ether_addr upstream_mac6;    /* learned via NDP             */
+    volatile uint8_t      upstream_mac6_valid;
+    uint8_t             wan_ll[16];        /* fe80:: EUI-64(wan_mac)      */
+
     /* Extra unicast MAC accepted on LAN RX (e2e bench injects frames
      * addressed to the fastrg-node WAN MAC; VF promiscuous is unavailable
      * without PF trust, so we add it as a second MAC filter). */
     struct rte_ether_addr lan_alias_mac;
     uint8_t               lan_alias_mac_set;
+
+    /* Solicited-node multicast MACs of lan_ip6 / lan_ip6_ll (identical when
+     * both end in the same three bytes, hence the count).  Upstream NDP sends
+     * its neighbour solicitations there, and a VF drops multicast it was not
+     * told to receive, so the LAN port has to subscribe to them explicitly.
+     * Empty until ipv6_addr_init() fills it. */
+    struct rte_ether_addr lan_mc_addrs[2];
+    uint32_t              lan_mc_count;
 
     /* NAT tables (internet-bound flows only — see struct nat_entry) */
     struct rte_hash    *nat_out_tbl;   /* (inner_ip, inner_port, proto) → outer_port */
@@ -309,9 +380,34 @@ struct bras_ctx {
     uint32_t            pri_dns;
     uint32_t            sec_dns;
 
+    /* DHCPv6 delegated-prefix pool and DNS servers. */
+    uint8_t             pd_pool_prefix[8];
+    uint8_t             pd_pool_plen;
+    /* pd_owner[i] is the session holding the i-th /56 of the pool, 0 = free;
+     * slots 1..pd_pool_slots-1 are handed out.  Same writer/reader split as
+     * ip_owner. */
+    uint16_t            pd_owner[MAX_SESSIONS + 1];
+    uint32_t            pd_pool_slots;
+    uint8_t             dns6_pri[16];
+    uint8_t             dns6_sec[16];
+
     /* Multi-queue: per-port queue count and lcore→TX-queue mapping */
     uint16_t            n_queues;
     uint16_t            lcore_queue[RTE_MAX_LCORE];
+    uint8_t             tx_queue_shared; /* serialize TX only when legacy
+                                          * lcores share a hardware queue */
+
+    /* Port-reset park protocol. Main writes dp_pause, claims reset pending,
+     * and requeues degraded ports; the interrupt thread only sets pending.
+     * Each datapath lcore writes only its own dp_ack slot. */
+    volatile uint8_t    dp_pause;
+    volatile uint8_t    dp_ack[RTE_MAX_LCORE];
+    volatile uint8_t    port_reset_pending[2];
+    volatile uint8_t    nd6_backoff_reset; /* main sets, ctrl consumes */
+    volatile uint8_t    warmup_pending;    /* main sets, ctrl consumes */
+    uint8_t             n_dp_lcores;
+    uint16_t            cfg_n_rxq;
+    uint16_t            cfg_n_txq;
 
     /* Software distributor datapath (X520/82599 VF cannot RSS PPPoE: the
      * inner IP is hidden behind the PPPoE header, so hardware always lands
@@ -332,7 +428,6 @@ struct bras_ctx {
     uint8_t             vlan_filter_enabled;
 
     /* Statistics */
-    uint64_t            stat_sessions_up;
     uint64_t            stat_pkts_rx;
     uint64_t            stat_pkts_tx;
     uint64_t            stat_pkts_dropped;
@@ -418,6 +513,12 @@ int  chap_verify_response(struct bras_session *sess, uint8_t *payload, uint16_t 
 void ipcp_send_conf_req(struct bras_session *sess);
 void ipcp_send_conf_ack(struct bras_session *sess, uint8_t id, uint32_t client_ip);
 void ipv6cp_start(struct bras_session *sess);
+uint8_t *ppp_begin_frame(struct rte_mbuf **out_mbuf,
+                         struct bras_session *sess, uint16_t ppp_proto,
+                         uint16_t payload_room);
+
+/* dhcpv6.c */
+void dhcpv6_input(struct bras_session *sess, const uint8_t *ip6, uint16_t len);
 
 /* nat.c — hybrid forwarding: backbone-local routed, internet-bound SNATed */
 int  route_outbound(struct rte_mbuf *mbuf, struct bras_session *sess);
@@ -435,7 +536,21 @@ int  ctrl_plane_lcore(void *arg);
 /* arp.c — LAN-side ARP + local ICMP echo responder */
 void arp_input(struct rte_mbuf *mbuf);          /* consumes mbuf */
 void arp_request_upstream(void);
+void arp_announce_local(void);                  /* ctrl lcore */
 int  lan_icmp_echo_input(struct rte_mbuf *mbuf); /* 0 = consumed */
+
+/* ipv6.c — callers/lcores are documented at each implementation. */
+void ipv6_mac_to_ifid(const struct rte_ether_addr *mac, uint8_t ifid[8]);
+void ipv6_addr_init(void);                         /* main lcore, after ports;
+                                                    * also fills lan_mc_addrs */
+int  ipv6_lan_input(struct rte_mbuf *mbuf);        /* RX lcore; 0 = consumed */
+int  ipv6_route_outbound(struct rte_mbuf *mbuf,
+                         struct bras_session *sess); /* data worker */
+int  ipv6_route_inbound(struct rte_mbuf *mbuf);    /* data worker */
+void ipv6_ctrl_input(struct bras_session *sess,
+                     const uint8_t *ip6, uint16_t len); /* ctrl lcore */
+void nd6_request_upstream(void);                   /* ctrl lcore */
+void nd6_announce_local(void);                     /* ctrl lcore */
 
 /* utils.c */
 struct rte_mbuf *alloc_pkt(uint16_t data_room);
@@ -446,5 +561,7 @@ void             drop_capture(struct rte_mbuf *mbuf, uint16_t port,
 uint16_t         alloc_session_id(void);
 void             free_session(uint16_t session_id);
 uint32_t         session_alloc_ip(uint16_t session_id);
+uint16_t         session_alloc_pd(uint16_t session_id);
+uint64_t         count_sessions_up(void);
 
 #endif /* BRAS_H */
