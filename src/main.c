@@ -753,22 +753,51 @@ free_session(uint16_t sid)
     if (sid == 0 || sid > MAX_SESSIONS) return;
     if (g_bras.stat_sessions_up > 0)
         g_bras.stat_sessions_up--;
+    struct bras_session *s = &g_bras.sessions[sid];
+    uint32_t ip_slot = s->client_ip - g_bras.ip_pool_start;
+    if (s->client_ip && ip_slot < g_bras.ip_pool_size &&
+        g_bras.ip_owner[ip_slot] == sid)
+        g_bras.ip_owner[ip_slot] = 0;
+    if (s->pd_index && g_bras.pd_owner[s->pd_index] == sid)
+        g_bras.pd_owner[s->pd_index] = 0;
     nat_flush_session(sid);
-    memset(&g_bras.sessions[sid], 0, sizeof(struct bras_session));
+    memset(s, 0, sizeof(struct bras_session));
+}
+
+/* Give the lowest free slot in owner[first, n) to sid; -1 when none is free. */
+static int
+pool_take(uint16_t *owner, uint32_t first, uint32_t n, uint16_t sid)
+{
+    for (uint32_t i = first; i < n; i++) {
+        if (owner[i] == 0) {
+            owner[i] = sid;
+            return (int)i;
+        }
+    }
+    return -1;
 }
 
 /*
- * Allocate one client IP from the linear pool [ip_pool_start, ip_pool_end].
- * session 1 → 192.168.200.130, session 2 → .131, …
- * Returns 0 when the session id exceeds the pool.
+ * Allocate the lowest free client IP in [ip_pool_start, ip_pool_end].  The
+ * address goes back to the pool in free_session().  Returns 0 when every
+ * address is taken.
  */
 uint32_t
 session_alloc_ip(uint16_t sid)
 {
-    uint32_t ip = g_bras.ip_pool_start + (uint32_t)(sid - 1);
-    if (ip > g_bras.ip_pool_end)
-        return 0;
-    return ip;
+    int slot = pool_take(g_bras.ip_owner, 0, g_bras.ip_pool_size, sid);
+    return slot < 0 ? 0 : g_bras.ip_pool_start + (uint32_t)slot;
+}
+
+/*
+ * Allocate the lowest free /56 slot of the PD pool.  The slot goes back to
+ * the pool in free_session().  Returns 0 when every slot is taken.
+ */
+uint16_t
+session_alloc_pd(uint16_t sid)
+{
+    int slot = pool_take(g_bras.pd_owner, 1, g_bras.pd_pool_slots, sid);
+    return slot < 0 ? 0 : (uint16_t)slot;
 }
 
 /* ── --vlans spec parser ──────────────────────────────────────────────── */
@@ -1118,6 +1147,14 @@ main(int argc, char *argv[])
         fprintf(stderr, "--ip-pool-end must be >= --ip-pool\n");
         return 1;
     }
+    /* No more than MAX_SESSIONS sessions exist at once, so a larger pool
+     * only ever hands out its first MAX_SESSIONS addresses or /56s. */
+    uint64_t pool_n = (uint64_t)g_bras.ip_pool_end - g_bras.ip_pool_start + 1;
+    g_bras.ip_pool_size = pool_n < MAX_SESSIONS ? (uint32_t)pool_n
+                                                : MAX_SESSIONS;
+    uint64_t pd_n = UINT64_C(1) << (DHCPV6_PD_PLEN - g_bras.pd_pool_plen);
+    g_bras.pd_pool_slots = pd_n < MAX_SESSIONS + 1 ? (uint32_t)pd_n
+                                                   : MAX_SESSIONS + 1;
 
     /* ── Check port count ────────────────────────────────────────────── */
     uint16_t nb_ports = rte_eth_dev_count_avail();

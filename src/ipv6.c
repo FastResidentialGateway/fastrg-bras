@@ -398,11 +398,14 @@ ipv6_route_inbound(struct rte_mbuf *mbuf)
     uint64_t pool_high = read_be64(g_bras.pd_pool_prefix);
     if (dst_high < pool_high)
         return -1;
-    uint64_t sid64 = (dst_high - pool_high) >> 8;
-    if (sid64 == 0 || sid64 > MAX_SESSIONS)
+    uint64_t slot = (dst_high - pool_high) >> 8;
+    if (slot == 0 || slot >= g_bras.pd_pool_slots)
+        return -1;
+    uint16_t sid = g_bras.pd_owner[slot];
+    if (sid == 0)
         return -1;
 
-    struct bras_session *sess = &g_bras.sessions[sid64];
+    struct bras_session *sess = &g_bras.sessions[sid];
     if (sess->state != SESS_UP || !sess->pd_active ||
         memcmp(dst, sess->pd_prefix, 7) != 0 || ip6->hop_limits <= 1)
         return -1;
