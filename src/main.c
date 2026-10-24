@@ -751,8 +751,6 @@ void
 free_session(uint16_t sid)
 {
     if (sid == 0 || sid > MAX_SESSIONS) return;
-    if (g_bras.stat_sessions_up > 0)
-        g_bras.stat_sessions_up--;
     struct bras_session *s = &g_bras.sessions[sid];
     uint32_t ip_slot = s->client_ip - g_bras.ip_pool_start;
     if (s->client_ip && ip_slot < g_bras.ip_pool_size &&
@@ -798,6 +796,17 @@ session_alloc_pd(uint16_t sid)
 {
     int slot = pool_take(g_bras.pd_owner, 1, g_bras.pd_pool_slots, sid);
     return slot < 0 ? 0 : (uint16_t)slot;
+}
+
+/* Number of sessions currently in SESS_UP. */
+uint64_t
+count_sessions_up(void)
+{
+    uint64_t n = 0;
+    for (int i = 1; i <= MAX_SESSIONS; i++)
+        if (g_bras.sessions[i].state == SESS_UP)
+            n++;
+    return n;
 }
 
 /* ── --vlans spec parser ──────────────────────────────────────────────── */
@@ -1402,7 +1411,7 @@ main(int argc, char *argv[])
         flockfile(g_timestamp_log_stream);
         fprintf(g_timestamp_log_stream,
                 "[BRAS] sessions_up=%-4lu  rx=%-10lu  tx=%-10lu  drop=%-6lu",
-                g_bras.stat_sessions_up,
+                count_sessions_up(),
                 g_bras.stat_pkts_rx,
                 g_bras.stat_pkts_tx,
                 g_bras.stat_pkts_dropped);

@@ -428,7 +428,6 @@ struct bras_ctx {
     uint8_t             vlan_filter_enabled;
 
     /* Statistics */
-    uint64_t            stat_sessions_up;
     uint64_t            stat_pkts_rx;
     uint64_t            stat_pkts_tx;
     uint64_t            stat_pkts_dropped;
@@ -563,5 +562,6 @@ uint16_t         alloc_session_id(void);
 void             free_session(uint16_t session_id);
 uint32_t         session_alloc_ip(uint16_t session_id);
 uint16_t         session_alloc_pd(uint16_t session_id);
+uint64_t         count_sessions_up(void);
 
 #endif /* BRAS_H */

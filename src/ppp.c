@@ -1113,7 +1113,6 @@ ppp_handle_ctrl(struct rte_mbuf *mbuf, uint16_t session_id)
                 ncp_stopped[session_id] = 0;
             }
             sess->state = SESS_UP;
-            g_bras.stat_sessions_up++;
             break;
         case LCP_TERM_REQ:
             RTE_LOG(INFO, PPP, "[%u] IPCP TERM_REQ from client\n", session_id);
